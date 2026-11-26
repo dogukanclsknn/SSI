@@ -1,0 +1,222 @@
+# SSI Windows OS template worker (docs/os-template-poc.md, "Windows").
+#
+# Builds an up-to-date Windows Server template ISO from an official ISO, offline, on the SSI
+# Windows build machine: scan the image build against Microsoft MSRC data, add the cumulative
+# update that closes the open CVEs, verify the build from the image itself, re-scan and gate
+# (no open CVE may remain), then write a bootable ISO, SHA256SUMS and template-manifest.json.
+# The work is poc/os-template/windows/Build-WindowsTemplate.ps1 from this checkout.
+#
+# Runs only in the dedicated 'SSI-Windows' pool (WINBUILD01, agent service as
+# NT AUTHORITY\SYSTEM: DISM, ISO attach and the offline registry need an administrator).
+# Inputs stay on the build machine under SSI_IMAGE_ROOT: the source ISO in iso\, the update
+# (.msu exactly as the Microsoft Update Catalog names it, with any checkpoint .msu) in updates\.
+# The template ISO stays in runs\<BuildId>\out on the machine; the run publishes the evidence,
+# the manifest and SHA256SUMS, never the multi-gigabyte ISO. A run removes only its own work
+# files.
+#
+# Started from SSI (OS Templates, src/lib/workerPipelineActions.js) for a build request OST-…:
+# SSI sets every parameter from the request and deliverToSsi=true, and the run sends the
+# template manifest back HMAC-signed (ssi.os-template-build/v1, scripts/os-template-evidence.mjs,
+# secret SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET). Started by hand, deliverToSsi stays false.
+trigger: none
+pr: none
+
+parameters:
+  - name: isoFile
+    displayName: Source ISO file name (in SSI_IMAGE_ROOT\iso)
+    type: string
+    default: WS2025_EVAL_en-us.iso
+  - name: isoSha256
+    displayName: Source ISO SHA-256 (64 hex, required)
+    type: string
+    default: ''
+  - name: imageIndex
+    displayName: install.wim index (2 = Standard, Desktop Experience)
+    type: number
+    default: 2
+  - name: product
+    displayName: Product name as MSRC spells it
+    type: string
+    default: Windows Server 2025
+  - name: templateName
+    displayName: Template name
+    type: string
+    default: ssi-ws2025-std-de
+  - name: osTemplateBuildId
+    displayName: SSI build request (OST-0001; only with deliverToSsi)
+    type: string
+    default: ''
+  - name: deliverToSsi
+    displayName: Deliver the signed result to SSI
+    type: boolean
+    default: false
+  # Fixed like the other workers': a run can only call this SSI back (docs/azure-devops-integration.md).
+  - name: ssiApiBaseUrl
+    displayName: SSI API base URL (only with deliverToSsi)
+    type: string
+    default: http://10.0.0.10:5021/api/v1
+    values:
+      - http://10.0.0.10:5021/api/v1
+      - http://ssi.example.com/api/v1
+  - name: allowInsecurePocApi
+    displayName: Allow a plain HTTP SSI address (internal PoC)
+    type: boolean
+    default: false
+
+pool:
+  name: 'SSI-Windows'
+
+variables:
+  SSI_IMAGE_ROOT: 'E:\SSI-Image'
+
+stages:
+  - stage: WindowsTemplate
+    displayName: 'Windows template'
+    jobs:
+      - job: BuildTemplate
+        displayName: 'Build the template ISO'
+        # A full run takes about 4.5 hours on WINBUILD01 (DISM on a virtual disk).
+        timeoutInMinutes: 480
+        steps:
+          - checkout: self
+
+          - powershell: |
+              $ErrorActionPreference = 'Stop'
+              $root      = $env:SSI_IMAGE_ROOT
+              $buildId   = "ado-$env:BUILD_BUILDID"
+              $evidence  = Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'os-template-windows'
+              $script    = Join-Path $env:BUILD_SOURCESDIRECTORY 'poc\os-template\windows\Build-WindowsTemplate.ps1'
+              New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+
+              # The reason is also written to the evidence folder, so the artifact step never
+              # fails with a second, misleading "Not found PathtoPublish" error.
+              function Fail([string]$Message) {
+                  Set-Content -Path (Join-Path $evidence 'failure.txt') -Value $Message -Encoding UTF8
+                  Write-Host "##vso[task.logissue type=error]$Message"
+                  exit 1
+              }
+              # A parameter value shown in a message: one line, at most 200 characters, no logging commands.
+              function Shown([string]$Value) {
+                  $one = ($Value -replace '[\r\n]', ' ')
+                  if ($one.Length -gt 200) { $one = $one.Substring(0, 200) }
+                  return ($one -replace '##vso\[', '##vso_[')
+              }
+
+              # --- Input validation (fail-closed, before anything is read or written) ---
+              $isoFile      = "$env:SSI_TEMPLATE_ISO_FILE".Trim()
+              $isoSha256    = "$env:SSI_TEMPLATE_ISO_SHA256".Trim().ToLowerInvariant()
+              $imageIndex   = "$env:SSI_TEMPLATE_IMAGE_INDEX".Trim()
+              $product      = "$env:SSI_TEMPLATE_PRODUCT".Trim()
+              $templateName = "$env:SSI_TEMPLATE_NAME".Trim()
+              if ($isoFile -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.iso$') { Fail "isoFile must be a plain .iso file name in $root\iso (received: $(Shown $isoFile))." }
+              if ($isoSha256 -notmatch '^[a-f0-9]{64}$') { Fail 'isoSha256 must be the 64-hex SHA-256 of the source ISO; the build refuses an unpinned ISO.' }
+              if ($imageIndex -notmatch '^([1-9]|1[0-6])$') { Fail "imageIndex must be 1-16 (received: $(Shown $imageIndex))." }
+              if ($product -notmatch '^Windows Server [0-9]{4}( \([A-Za-z ]+\))?$') { Fail "product must look like 'Windows Server 2025' (received: $(Shown $product))." }
+              if ($templateName -notmatch '^[a-z0-9][a-z0-9-]{1,40}$') { Fail "templateName may hold lower-case letters, digits and dashes (received: $(Shown $templateName))." }
+              $deliver = "$env:SSI_TEMPLATE_DELIVER".Trim().ToLowerInvariant()
+              if ($deliver -ne 'true' -and $deliver -ne 'false') { Fail 'deliverToSsi must be true or false.' }
+              if ($deliver -eq 'true') {
+                  $requestId = "$env:SSI_TEMPLATE_BUILD_REQUEST".Trim()
+                  $apiBase = "$env:SSI_API_BASE_URL".Trim()
+                  if ($requestId -notmatch '^OST-[0-9]{4,}$') { Fail "osTemplateBuildId must look like OST-0001 when deliverToSsi is true (received: $(Shown $requestId))." }
+                  if ($apiBase -notmatch '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$') { Fail "ssiApiBaseUrl must be an http(s) URL without credentials or query (received: $(Shown $apiBase))." }
+                  if ($apiBase.StartsWith('http://') -and "$env:SSI_ALLOW_INSECURE_POC_API".Trim().ToLowerInvariant() -ne 'true') { Fail 'ssiApiBaseUrl is plain HTTP; allowInsecurePocApi must be true for the internal PoC.' }
+                  $secret = "$env:SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET"
+                  if ($secret.Length -lt 32 -or $secret.Contains('$(')) { Fail 'The pipeline secret SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET is not set; the result could not be delivered.' }
+              }
+              $isoPath = Join-Path (Join-Path $root 'iso') $isoFile
+              if (-not (Test-Path -LiteralPath $isoPath -PathType Leaf)) { Fail "$isoPath does not exist on this build machine." }
+              if (-not (Test-Path -LiteralPath $script -PathType Leaf)) { Fail 'Build-WindowsTemplate.ps1 is missing from the SSI checkout.' }
+              $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+              if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Fail 'The agent service must run as an administrator (NT AUTHORITY\SYSTEM).' }
+
+              try {
+                  & $script -IsoPath $isoPath -ExpectedIsoSha256 $isoSha256 -ImageIndex ([int]$imageIndex) `
+                      -UpdatesPath (Join-Path $root 'updates') -WorkRoot (Join-Path $root 'runs') `
+                      -Product $product -TemplateName $templateName -BuildId $buildId
+              }
+              catch { Fail "Template build failed: $(Shown $_.Exception.Message)" }
+            displayName: 'Validate inputs and build the template'
+            errorActionPreference: stop
+            failOnStderr: false
+            env:
+              SSI_TEMPLATE_ISO_FILE: ${{ parameters.isoFile }}
+              SSI_TEMPLATE_ISO_SHA256: ${{ parameters.isoSha256 }}
+              SSI_TEMPLATE_IMAGE_INDEX: ${{ parameters.imageIndex }}
+              SSI_TEMPLATE_PRODUCT: ${{ parameters.product }}
+              SSI_TEMPLATE_NAME: ${{ parameters.templateName }}
+              SSI_TEMPLATE_DELIVER: ${{ parameters.deliverToSsi }}
+              SSI_TEMPLATE_BUILD_REQUEST: ${{ parameters.osTemplateBuildId }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              SSI_ALLOW_INSECURE_POC_API: ${{ parameters.allowInsecurePocApi }}
+              SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET: $(SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET)
+
+          # Only to sign and deliver the result with the tested SSI code (not installed on the machine).
+          - task: UseNode@1
+            displayName: 'Use Node 22'
+            condition: and(succeeded(), eq('${{ parameters.deliverToSsi }}', 'true'))
+            inputs:
+              version: '22.x'
+
+          - powershell: |
+              $ErrorActionPreference = 'Stop'
+              $run = Join-Path (Join-Path $env:SSI_IMAGE_ROOT 'runs') "ado-$env:BUILD_BUILDID"
+              $tool = Join-Path $env:BUILD_SOURCESDIRECTORY 'scripts\os-template-evidence.mjs'
+              $iso = Get-ChildItem -Path (Join-Path $run 'out') -Filter '*.iso' | Select-Object -First 1
+              if (-not $iso) { Write-Host '##vso[task.logissue type=error]The build left no template ISO to report.'; exit 1 }
+              $result = Join-Path $run 'evidence\ssi-result.json'
+              $manifest = Join-Path $run 'out\template-manifest.json'
+              $requestId = "$env:SSI_TEMPLATE_BUILD_REQUEST".Trim()
+              $apiBase = "$env:SSI_API_BASE_URL".Trim()
+              $allowHttp = "$env:SSI_ALLOW_INSECURE_POC_API".Trim().ToLowerInvariant()
+              $workerId = "ado-$env:BUILD_BUILDID-$env:AGENT_NAME"
+              & node $tool assemble --manifest $manifest --build-id $requestId --location-host $env:COMPUTERNAME `
+                  --location-path $iso.FullName --out $result `
+                  --pipeline $env:BUILD_DEFINITIONNAME --ado-build-id $env:BUILD_BUILDID --agent $env:AGENT_NAME
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              & node $tool deliver --file $result --api-base-url $apiBase --allow-http $allowHttp --worker-id $workerId
+              exit $LASTEXITCODE
+            displayName: 'Deliver the signed result to SSI'
+            condition: and(succeeded(), eq('${{ parameters.deliverToSsi }}', 'true'))
+            env:
+              SSI_TEMPLATE_BUILD_REQUEST: ${{ parameters.osTemplateBuildId }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              SSI_ALLOW_INSECURE_POC_API: ${{ parameters.allowInsecurePocApi }}
+              SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET: $(SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET)
+
+          - powershell: |
+              $run = Join-Path (Join-Path $env:SSI_IMAGE_ROOT 'runs') "ado-$env:BUILD_BUILDID"
+              $target = Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'os-template-windows'
+              New-Item -ItemType Directory -Force -Path $target | Out-Null
+              if (Test-Path (Join-Path $run 'evidence')) {
+                  Copy-Item -Path (Join-Path $run 'evidence\*') -Destination $target -Recurse -Force
+              }
+              # The manifest and checksums travel with the evidence; the ISO stays on the machine.
+              foreach ($name in 'template-manifest.json', 'SHA256SUMS') {
+                  $file = Join-Path $run "out\$name"
+                  if (Test-Path $file) { Copy-Item -Path $file -Destination $target -Force }
+              }
+              $iso = Get-ChildItem -Path (Join-Path $run 'out') -Filter '*.iso' -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($iso) { Set-Content -Path (Join-Path $target 'iso-location.txt') -Value "${env:COMPUTERNAME}:$($iso.FullName)" -Encoding UTF8 }
+            displayName: 'Collect evidence (no ISO)'
+            condition: succeededOrFailed()
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish template evidence'
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/os-template-windows'
+              ArtifactName: 'os-template-windows-evidence'
+              publishLocation: 'Container'
+
+          - powershell: |
+              # Only this run's work files (the serviced WIM copy and the ISO tree, ~17 GB).
+              # The template ISO, the evidence and every other run are kept.
+              $run = Join-Path (Join-Path $env:SSI_IMAGE_ROOT 'runs') "ado-$env:BUILD_BUILDID"
+              foreach ($name in 'work', 'scratch') {
+                  $path = Join-Path $run $name
+                  if (Test-Path $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+              }
+              Write-Host 'Cleanup done: only this run''s work files were removed.'
+            displayName: 'Cleanup (only this run)'
+            condition: always()

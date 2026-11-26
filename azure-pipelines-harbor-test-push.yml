@@ -1,0 +1,109 @@
+# Manual Harbor test image push pipeline.
+# This pipeline does not deploy SSI and does not run automatically.
+trigger: none
+pr: none
+
+parameters:
+  - name: sourceImage
+    displayName: Source image
+    type: string
+    default: docker://docker.io/library/alpine:3.20
+  # Test images only: the repository must start with ssi-test-, so this helper can never
+  # write into the quarantine (onboarded/) or the approved catalog (approved/).
+  - name: targetRepository
+    displayName: Target Harbor repository (ssi-test-...)
+    type: string
+    default: ssi-test-alpine
+  - name: targetTag
+    displayName: Target Harbor tag
+    type: string
+    default: "3.20"
+  - name: diagnosticsOnly
+    displayName: Sadece agent ağ tanılamasını çalıştır
+    type: boolean
+    default: false
+
+pool: 'LinuxPool'
+
+# Values in this block are fixed: a run cannot override them.
+variables:
+  REGCTL_IMAGE: docker.io/regclient/regctl@sha256:dbe356c6cf9f8f85e302b9e47fed481ef3f1b04807350e99b02ab2cadee0a993
+  HARBOR_URL: registry.example.com
+  HARBOR_PROJECT: ssi-images
+  # Azure DevOps agent container DNS can fail to resolve the internal Harbor FQDN.
+  # Keep the image name on the FQDN, but inject this host mapping for the temporary registry client container.
+  HARBOR_HOST_IP: 10.0.0.20
+
+stages:
+  - stage: PushTestImage
+    displayName: 'Push Test Image to Harbor'
+    jobs:
+      - job: RegistryCopy
+        displayName: 'Copy public test image to Harbor'
+        steps:
+          - script: |
+              set -euo pipefail
+
+              # Parameters arrive through the environment, never pasted into the script text.
+              SOURCE_REF="${SOURCE_IMAGE#docker://}"
+              if [[ ! "${TARGET_REPOSITORY}" =~ ^ssi-test-[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+                echo 'targetRepository must be a test repository named ssi-test-<name>.'
+                exit 2
+              fi
+              if [[ ! "${TARGET_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+                echo 'targetTag is not a valid tag.'
+                exit 2
+              fi
+              TARGET_REF="${HARBOR_URL}/${HARBOR_PROJECT}/${TARGET_REPOSITORY}:${TARGET_TAG}"
+              DOCKER_HOST_ARGS=()
+              DOCKER_NETWORK_ARGS=(--network host)
+
+              if [ -n "${HARBOR_HOST_IP:-}" ]; then
+                echo "Using Harbor host mapping: ${HARBOR_URL} -> ${HARBOR_HOST_IP}"
+                DOCKER_HOST_ARGS+=(--add-host "${HARBOR_URL}:${HARBOR_HOST_IP}")
+              fi
+
+              echo "Network/DNS preflight..."
+              echo "Agent name: ${AGENT_NAME:-unknown}"
+              echo "Agent machine: ${AGENT_MACHINENAME:-unknown}"
+              echo "Harbor hedefi için kaynak rota:"
+              ip -4 route get "${HARBOR_HOST_IP}" || true
+              getent hosts "${HARBOR_URL}" || true
+              timeout 5 bash -lc "cat < /dev/null > /dev/tcp/${HARBOR_URL}/443" \
+                && echo "Harbor 443 is reachable from agent host." \
+                || echo "Warning: Harbor 443 preflight failed from agent host; regctl will still try from host network."
+
+              if [ "$(printf '%s' "${DIAGNOSTICS_ONLY}" | tr '[:upper:]' '[:lower:]')" = 'true' ]; then
+                echo "Diagnostics-only run completed. No image copy was attempted."
+                exit 0
+              fi
+
+              if ! command -v docker >/dev/null 2>&1; then
+                echo "Neither skopeo nor docker is available on this agent."
+                echo "Use an agent with Docker access enabled."
+                exit 1
+              fi
+
+              echo "Using regctl for HTTPS registry copy with TLS verification disabled only for Harbor."
+              docker version
+
+              docker run --rm \
+                "${DOCKER_NETWORK_ARGS[@]}" \
+                "${DOCKER_HOST_ARGS[@]}" \
+                "${REGCTL_IMAGE}" \
+                --host "reg=${HARBOR_URL},user=${HARBOR_ROBOT_USERNAME},pass=${HARBOR_ROBOT_SECRET},tls=insecure" \
+                image copy \
+                -v info \
+                "${SOURCE_REF}" \
+                "${TARGET_REF}"
+
+              echo "Test image pushed. Harbor scan-on-push should start automatically."
+            displayName: 'Copy image with regctl'
+            env:
+              SOURCE_IMAGE: ${{ parameters.sourceImage }}
+              TARGET_REPOSITORY: ${{ parameters.targetRepository }}
+              TARGET_TAG: ${{ parameters.targetTag }}
+              DIAGNOSTICS_ONLY: ${{ parameters.diagnosticsOnly }}
+              REGCTL_IMAGE: $(REGCTL_IMAGE)
+              HARBOR_ROBOT_USERNAME: $(HARBOR_ROBOT_USERNAME)
+              HARBOR_ROBOT_SECRET: $(HARBOR_ROBOT_SECRET)

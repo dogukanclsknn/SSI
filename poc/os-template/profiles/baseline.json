@@ -1,0 +1,7 @@
+{
+  "profileVersion": "ssi.os-template-profile/v1",
+  "name": "baseline",
+  "description": "Removals for every template. Empty until the organisation's hardening standard (e.g. CIS) defines them.",
+  "baseTemplate": "ssi-ubuntu-2404",
+  "remove": []
+}

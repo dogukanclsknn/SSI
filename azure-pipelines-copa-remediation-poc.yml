@@ -1,0 +1,1279 @@
+# Manual Copa patch and verification PoC worker.
+#
+# The worker is independent from SSI deployment and the web/API container. Its
+# default mode validates the canonical input only. A registry mutation happens
+# only when an operator explicitly sets executeRemediation=true.
+trigger: none
+pr: none
+
+parameters:
+  - name: sourceRepository
+    displayName: Harbor source repository
+    type: string
+    default: ssi-remediation-test
+  - name: sourceDigest
+    displayName: Immutable source digest (sha256:...)
+    type: string
+    default: sha256:2bcabc23b45489fb0885d69a06ba1d648aeda973fae7bb981bafbb884165e514
+  - name: remediationJobId
+    displayName: SSI Dry Run remediation job ID
+    type: string
+    default: RM-DRY-0001
+  - name: canonicalPipelineDefinitionId
+    displayName: Canonical Trivy pipeline definition ID
+    type: string
+    default: '4417'
+  - name: canonicalBuildId
+    displayName: Canonical Trivy Azure build ID
+    type: string
+    default: '774757'
+  - name: canonicalReceiptContentDigest
+    displayName: Expected canonical Trivy JSON content digest (sha256:...)
+    type: string
+    default: sha256:0d545319fb56250d3ed11214c72fbbd2d566f4f21c9bd454923fb91ff571d974
+  - name: outputRepository
+    displayName: Harbor PoC output repository
+    type: string
+    default: ssi-remediation-test
+  - name: outputTag
+    displayName: New PoC output tag (copa-poc-*)
+    type: string
+    default: copa-poc-20260730-r1
+  - name: harborCaCertPath
+    displayName: Trusted Harbor CA PEM path, or system
+    type: string
+    default: system
+  - name: executeRemediation
+    displayName: Execute Copa patch, test-tag push, and verification re-scan
+    type: boolean
+    default: false
+
+pool: 'LinuxPool'
+
+variables:
+  HARBOR_HOST: registry.example.com
+  HARBOR_PROJECT: ssi-images
+  HARBOR_HOST_IP: 10.0.0.20
+  # Official Trivy v0.70.0 multi-platform manifest, pinned by digest.
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+  # Official Copacetic v0.14.2 OCI index, pinned by digest.
+  COPA_FRONTEND_IMAGE: ghcr.io/project-copacetic/copacetic-frontend@sha256:31e6e7c05f10c9a1b73351af3cc81baa9c5141c6d5f9cb9bb449e409b6ca4855
+  COPA_FRONTEND_VERSION: '0.14.2'
+  # Pinned tools for the job-scoped registry bridge. The bridge avoids an
+  # upstream BuildKit private-registry auth failure without weakening Harbor TLS.
+  REGCTL_IMAGE: docker.io/regclient/regctl@sha256:dbe356c6cf9f8f85e302b9e47fed481ef3f1b04807350e99b02ab2cadee0a993
+  LOCAL_REGISTRY_IMAGE: docker.io/library/registry@sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33
+
+stages:
+  - stage: CopaRemediationPoc
+    displayName: 'Copa Patch and Verification PoC'
+    jobs:
+      - job: PatchAndVerify
+        displayName: 'Prepare immutable input; patch only with explicit approval'
+        steps:
+          - script: |
+              set -euo pipefail
+              umask 077
+
+              RUN_DIR="$(Pipeline.Workspace)/copa-remediation-poc"
+              EVIDENCE_DIR="${RUN_DIR}/evidence"
+              mkdir -p "${EVIDENCE_DIR}"
+              export SSI_PREFLIGHT_EVIDENCE_PATH="${EVIDENCE_DIR}/callback-preflight.json"
+
+              node <<'NODE'
+              const dns = require('node:dns');
+              const fs = require('node:fs');
+              const http = require('node:http');
+              const https = require('node:https');
+              const { execFileSync } = require('node:child_process');
+
+              const diagnostic = {
+                schemaVersion: 1,
+                kind: 'ssi.remediation.callback-preflight',
+                executeRemediation:
+                  String(process.env.SSI_COPA_EXECUTE_REMEDIATION || '').toLowerCase() === 'true',
+                agent: {
+                  name: String(process.env.SSI_EVIDENCE_WORKER_ID || 'unknown'),
+                  machine: String(process.env.SSI_EVIDENCE_WORKER_MACHINE || 'unknown'),
+                },
+              };
+              const transientConnectivityCodes = new Set([
+                'EAI_AGAIN',
+                'ECONNREFUSED',
+                'ECONNRESET',
+                'EHOSTUNREACH',
+                'ENETUNREACH',
+                'ENOTFOUND',
+                'EPIPE',
+                'ETIMEDOUT',
+              ]);
+
+              const escapeAzureMessage = (value) =>
+                String(value)
+                  .replaceAll('%', '%25')
+                  .replaceAll('\r', '%0D')
+                  .replaceAll('\n', '%0A')
+                  .replaceAll(']', '%5D')
+                  .replaceAll(';', '%3B');
+              const setCallbackReachable = (value) => {
+                console.log(`##vso[task.setvariable variable=SSI_CALLBACK_REACHABLE]${value ? 'true' : 'false'}`);
+              };
+              const emitWarning = (message) => {
+                console.log(`##vso[task.logissue type=warning]${escapeAzureMessage(message)}`);
+              };
+
+              const writeEvidence = (status, details = {}) => {
+                const evidencePath = String(process.env.SSI_PREFLIGHT_EVIDENCE_PATH || '').trim();
+                if (!evidencePath) return;
+
+                const payload = {
+                  ...diagnostic,
+                  ...details,
+                  status,
+                  observedAt: new Date().toISOString(),
+                };
+                const temporaryPath = `${evidencePath}.tmp-${process.pid}`;
+                fs.writeFileSync(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, {
+                  mode: 0o600,
+                });
+                fs.renameSync(temporaryPath, evidencePath);
+              };
+
+              const required = (name) => {
+                const value = String(process.env[name] || '').trim();
+                if (!value || value.includes('$(')) {
+                  throw new Error(`Variable ${name} is required for the SSI callback preflight.`);
+                }
+                return value;
+              };
+
+              const lookupAll = (hostname) =>
+                new Promise((resolve, reject) => {
+                  dns.lookup(hostname, { all: true }, (error, addresses) => {
+                    if (error) reject(error);
+                    else resolve(addresses);
+                  });
+                });
+
+              const probe = (url, timeoutMs) =>
+                new Promise((resolve, reject) => {
+                  const transport = url.protocol === 'https:' ? https : http;
+                  let settled = false;
+                  const finish = (callback, value) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(deadline);
+                    callback(value);
+                  };
+                  const request = transport.request(
+                    url,
+                    { method: 'GET', headers: { Accept: 'application/json' } },
+                    (response) => {
+                      let responseBytes = 0;
+                      response.on('data', (chunk) => {
+                        responseBytes += Buffer.byteLength(chunk);
+                        if (responseBytes > 64 * 1024) {
+                          const error = new Error('SSI health response exceeded the 64 KiB safety limit.');
+                          error.code = 'ERESPONSETOOLARGE';
+                          response.destroy(error);
+                          finish(reject, error);
+                        }
+                      });
+                      response.on('end', () => finish(resolve, response.statusCode || 0));
+                      response.on('error', (error) => finish(reject, error));
+                    },
+                  );
+                  const deadline = setTimeout(() => {
+                    const error = new Error(`SSI callback preflight timed out after ${timeoutMs} ms.`);
+                    error.code = 'ETIMEDOUT';
+                    request.destroy(error);
+                    finish(reject, error);
+                  }, timeoutMs);
+                  request.on('error', (error) => finish(reject, error));
+                  request.end();
+                });
+
+              async function main() {
+                const agentName = diagnostic.agent.name;
+                const agentMachine = diagnostic.agent.machine;
+                setCallbackReachable(false);
+                if (!diagnostic.executeRemediation) {
+                  writeEvidence('skipped', {
+                    reason: 'Prepare-only run; callback connectivity is not required.',
+                  });
+                  console.log('Prepare-only run: SSI evidence callback preflight is not required.');
+                  return;
+                }
+
+                const baseUrl = new URL(required('SSI_API_BASE_URL'));
+                if (baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) {
+                  throw new Error('SSI_API_BASE_URL must not contain credentials, query parameters, or a fragment.');
+                }
+                const allowHttp = String(process.env.SSI_API_ALLOW_HTTP || '').toLowerCase() === 'true';
+                if (baseUrl.protocol !== 'https:' && !(allowHttp && baseUrl.protocol === 'http:')) {
+                  throw new Error('SSI_API_BASE_URL must use HTTPS unless SSI_API_ALLOW_HTTP=true is explicitly set for the internal PoC.');
+                }
+
+                const healthUrl = new URL(baseUrl);
+                healthUrl.pathname = `${healthUrl.pathname.replace(/\/$/, '')}/health`;
+                const targetPort = healthUrl.port || (healthUrl.protocol === 'https:' ? '443' : '80');
+                diagnostic.target = {
+                  protocol: healthUrl.protocol,
+                  host: healthUrl.hostname,
+                  port: Number(targetPort),
+                  path: healthUrl.pathname,
+                };
+                console.log(`Agent: ${agentName} on ${agentMachine}`);
+                console.log(`SSI callback preflight target: ${healthUrl.hostname}:${targetPort}/TCP (${healthUrl.pathname})`);
+
+                const addresses = await lookupAll(healthUrl.hostname);
+                if (addresses.length === 0) {
+                  const error = new Error(`DNS returned no addresses for ${healthUrl.hostname}.`);
+                  error.code = 'ENOTFOUND';
+                  throw error;
+                }
+                diagnostic.resolvedAddresses = addresses.map(({ address, family }) => ({
+                  address,
+                  family,
+                }));
+                console.log(`Resolved addresses: ${addresses.map(({ address }) => address).join(', ')}`);
+
+                let sourceIp = 'unknown';
+                const routeAddress = addresses.find(({ family }) => family === 4)?.address || addresses[0].address;
+                try {
+                  const route = execFileSync('ip', ['route', 'get', routeAddress], {
+                    encoding: 'utf8',
+                    timeout: 3000,
+                  }).trim();
+                  console.log(`Source route: ${route}`);
+                  sourceIp = route.match(/\bsrc\s+(\S+)/)?.[1] || sourceIp;
+                  diagnostic.sourceRoute = route.slice(0, 500);
+                } catch (error) {
+                  console.log(`Source route diagnostic unavailable: ${String(error.message || error).slice(0, 200)}`);
+                }
+                diagnostic.sourceIp = sourceIp;
+
+                try {
+                  const status = await probe(healthUrl, 5000);
+                  diagnostic.healthStatus = status;
+                  if (status !== 200) {
+                    const error = new Error(`SSI health endpoint returned HTTP ${status}.`);
+                    error.code = 'EHEALTHSTATUS';
+                    throw error;
+                  }
+                } catch (error) {
+                  const code = String(error.code || 'ECONNECTION');
+                  const wrappedError = new Error(
+                    `SSI callback preflight failed (${code}). Agent ${agentName} on ${agentMachine}, ` +
+                      `source ${sourceIp}, target ${healthUrl.hostname}:${targetPort}/TCP. ` +
+                      'Permit this exact source-to-target path or route the pipeline ' +
+                      'to a dedicated remediation worker that can reach the SSI API.',
+                  );
+                  wrappedError.code = code;
+                  throw wrappedError;
+                }
+
+                setCallbackReachable(true);
+                writeEvidence('passed');
+                console.log(`SSI callback path is reachable from source ${sourceIp}; health check returned HTTP 200.`);
+              }
+
+              main().catch((error) => {
+                const code = String(error.code || 'EPREFLIGHT');
+                const retryable = transientConnectivityCodes.has(code);
+                const errorDetails = {
+                  error: {
+                    code,
+                    message: String(error.message || error).slice(0, 1000),
+                  },
+                  retryable,
+                };
+                setCallbackReachable(false);
+                if (retryable) {
+                  writeEvidence('unreachable', errorDetails);
+                  emitWarning(
+                    `${errorDetails.error.message} Copa patch and immutable re-scan may continue; ` +
+                      'signed evidence delivery will be recorded as pending.',
+                  );
+                  console.log('SSI callback is temporarily unreachable; continuing with remediation evidence preserved for retry.');
+                  return;
+                }
+
+                writeEvidence('failed', errorDetails);
+                console.error(error.message);
+                process.exitCode = 1;
+              });
+              NODE
+            displayName: 'Preflight SSI evidence callback path'
+            env:
+              SSI_COPA_EXECUTE_REMEDIATION: ${{ parameters.executeRemediation }}
+              SSI_API_BASE_URL: $(SSI_API_BASE_URL)
+              SSI_API_ALLOW_HTTP: $(SSI_API_ALLOW_HTTP)
+              SSI_EVIDENCE_WORKER_ID: $(Agent.Name)
+              SSI_EVIDENCE_WORKER_MACHINE: $(Agent.MachineName)
+
+          # This artifact is the audited Copa input. The script below validates
+          # content digest, source binding, schema, OS-only scope, and fixability.
+          - task: DownloadBuildArtifacts@0
+            displayName: 'Download canonical Trivy JSON artifact'
+            inputs:
+              buildType: 'specific'
+              project: '$(System.TeamProject)'
+              pipeline: ${{ parameters.canonicalPipelineDefinitionId }}
+              buildVersionToDownload: 'specific'
+              buildId: ${{ parameters.canonicalBuildId }}
+              downloadType: 'single'
+              artifactName: 'canonical-trivy-os-report'
+              downloadPath: '$(Pipeline.Workspace)/copa-remediation-poc/canonical-input'
+
+          - script: |
+              set -euo pipefail
+              umask 077
+
+              SOURCE_REPOSITORY="${SSI_COPA_SOURCE_REPOSITORY:?SSI_COPA_SOURCE_REPOSITORY is required}"
+              SOURCE_DIGEST="${SSI_COPA_SOURCE_DIGEST:?SSI_COPA_SOURCE_DIGEST is required}"
+              EXPECTED_REPORT_DIGEST="${SSI_COPA_CANONICAL_RECEIPT_CONTENT_DIGEST:?SSI_COPA_CANONICAL_RECEIPT_CONTENT_DIGEST is required}"
+              OUTPUT_REPOSITORY="${SSI_COPA_OUTPUT_REPOSITORY:?SSI_COPA_OUTPUT_REPOSITORY is required}"
+              OUTPUT_TAG="${SSI_COPA_OUTPUT_TAG:?SSI_COPA_OUTPUT_TAG is required}"
+              RUN_DIR="$(Pipeline.Workspace)/copa-remediation-poc"
+              INPUT_DIR="${RUN_DIR}/canonical-input"
+              EVIDENCE_DIR="${RUN_DIR}/evidence"
+              REPORT_CONTEXT="${RUN_DIR}/report-context"
+
+              if [[ ! "${SOURCE_REPOSITORY}" =~ ^[a-z0-9][a-z0-9._/-]*$ ]]; then
+                echo 'sourceRepository must be a lower-case Harbor repository path.'
+                exit 2
+              fi
+              if [[ ! "${OUTPUT_REPOSITORY}" =~ ^[a-z0-9][a-z0-9._/-]*$ ]]; then
+                echo 'outputRepository must be a lower-case Harbor repository path.'
+                exit 2
+              fi
+              # A patched image is an unreviewed candidate: it never lands in the approved
+              # catalog. Only the controlled publish worker writes under approved/.
+              if [[ "${OUTPUT_REPOSITORY}" == approved || "${OUTPUT_REPOSITORY}" == approved/* || "${OUTPUT_REPOSITORY}" == *..* ]]; then
+                echo 'outputRepository must not be in the approved catalog (approved/); Copa output stays in quarantine.'
+                exit 2
+              fi
+              if [[ ! "${SOURCE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'sourceDigest must be a complete immutable sha256 digest. Tags are intentionally rejected.'
+                exit 2
+              fi
+              if [[ ! "${EXPECTED_REPORT_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'canonicalReceiptContentDigest must be a complete sha256 digest.'
+                exit 2
+              fi
+              if [[ ! "${OUTPUT_TAG}" =~ ^copa-poc-[a-z0-9][a-z0-9.-]{0,110}$ ]]; then
+                echo 'outputTag must start with copa-poc- and use a valid lower-case test tag.'
+                exit 2
+              fi
+
+              mapfile -t REPORTS < <(find "${INPUT_DIR}" -type f -name canonical-trivy.json -print)
+              if [[ "${#REPORTS[@]}" -ne 1 ]]; then
+                echo 'Expected exactly one canonical-trivy.json in the selected Azure build artifact.'
+                exit 2
+              fi
+
+              CANONICAL_REPORT="${REPORTS[0]}"
+              ACTUAL_REPORT_DIGEST="sha256:$(sha256sum "${CANONICAL_REPORT}" | awk '{print $1}')"
+              if [[ "${ACTUAL_REPORT_DIGEST}" != "${EXPECTED_REPORT_DIGEST}" ]]; then
+                echo 'Canonical report content digest does not match the approved receipt.'
+                echo "Expected: ${EXPECTED_REPORT_DIGEST}"
+                echo "Actual:   ${ACTUAL_REPORT_DIGEST}"
+                exit 2
+              fi
+
+              mkdir -p "${EVIDENCE_DIR}" "${REPORT_CONTEXT}"
+              cp "${CANONICAL_REPORT}" "${REPORT_CONTEXT}/canonical-trivy.json"
+
+              export SSI_COPA_SOURCE_REPOSITORY="${SOURCE_REPOSITORY}"
+              export SSI_COPA_SOURCE_DIGEST="${SOURCE_DIGEST}"
+              export SSI_COPA_OUTPUT_REPOSITORY="${OUTPUT_REPOSITORY}"
+              export SSI_COPA_OUTPUT_TAG="${OUTPUT_TAG}"
+              export SSI_COPA_CANONICAL_DIGEST="${ACTUAL_REPORT_DIGEST}"
+              export SSI_COPA_CANONICAL_REPORT_PATH="${REPORT_CONTEXT}/canonical-trivy.json"
+              export SSI_COPA_EVIDENCE_DIR="${EVIDENCE_DIR}"
+              export SSI_COPA_HARBOR_HOST="${HARBOR_HOST}"
+              export SSI_COPA_HARBOR_PROJECT="${HARBOR_PROJECT}"
+              export SSI_COPA_FRONTEND_IMAGE="${COPA_FRONTEND_IMAGE}"
+              export SSI_COPA_FRONTEND_VERSION="${COPA_FRONTEND_VERSION}"
+
+              node <<'NODE'
+              const fs = require('node:fs');
+              const path = require('node:path');
+              const report = JSON.parse(fs.readFileSync(process.env.SSI_COPA_CANONICAL_REPORT_PATH, 'utf8'));
+              const results = Array.isArray(report.Results) ? report.Results : [];
+              const sourceDigest = process.env.SSI_COPA_SOURCE_DIGEST;
+              const references = [report.ArtifactName, ...(report.Metadata?.RepoDigests || [])]
+                .filter(Boolean)
+                .map(String);
+              const hasSourceDigest = references.some((reference) => reference.includes(sourceDigest));
+              const nonOsResults = results.filter((result) => result.Class !== 'os-pkgs');
+              const findings = results.flatMap((result) => result.Vulnerabilities || []);
+              const eligible = findings.filter((finding) => String(finding.FixedVersion || '').trim());
+              const executeValue = String(process.env.SSI_COPA_EXECUTE_REMEDIATION || '').trim().toLowerCase();
+
+              if (!['true', 'false'].includes(executeValue)) {
+                throw new Error('executeRemediation must resolve to an explicit boolean value.');
+              }
+              if (Number(report.SchemaVersion) !== 2 || !hasSourceDigest || nonOsResults.length > 0 || eligible.length === 0) {
+                throw new Error('Canonical input must be SchemaVersion 2, bound to the immutable source digest, OS-only, and contain at least one fixed package version.');
+              }
+
+              const prepared = {
+                contractVersion: 'ssi.copa-remediation-poc/v1alpha1',
+                mode: executeValue === 'true' ? 'approved-poc-execution' : 'prepare-only',
+                generatedAt: new Date().toISOString(),
+                source: {
+                  immutableReference: `${process.env.SSI_COPA_HARBOR_HOST}/${process.env.SSI_COPA_HARBOR_PROJECT}/${process.env.SSI_COPA_SOURCE_REPOSITORY}@${sourceDigest}`,
+                  digest: sourceDigest,
+                },
+                canonicalInput: {
+                  artifactName: report.ArtifactName || '',
+                  contentDigest: process.env.SSI_COPA_CANONICAL_DIGEST,
+                  trivyVersion: report.Trivy?.Version || '',
+                  schemaVersion: Number(report.SchemaVersion),
+                  scope: 'os-packages-only',
+                  findings: findings.length,
+                  eligibleFindings: eligible.length,
+                },
+                proposedOutput: {
+                  reference: `${process.env.SSI_COPA_HARBOR_HOST}/${process.env.SSI_COPA_HARBOR_PROJECT}/${process.env.SSI_COPA_OUTPUT_REPOSITORY}:${process.env.SSI_COPA_OUTPUT_TAG}`,
+                  sourceMutation: 'forbidden',
+                  approvedPublishAttempted: false,
+                },
+                engine: {
+                  name: 'Copacetic BuildKit frontend',
+                  version: process.env.SSI_COPA_FRONTEND_VERSION,
+                  image: process.env.SSI_COPA_FRONTEND_IMAGE,
+                  packageScope: 'os',
+                },
+              };
+              fs.writeFileSync(
+                path.join(process.env.SSI_COPA_EVIDENCE_DIR, 'prepared-remediation-input.json'),
+                `${JSON.stringify(prepared, null, 2)}\n`,
+              );
+              console.log(`Canonical input validated: ${eligible.length}/${findings.length} OS package finding(s) are eligible.`);
+              NODE
+            displayName: 'Validate immutable canonical Copa input'
+            env:
+              SSI_COPA_SOURCE_REPOSITORY: ${{ parameters.sourceRepository }}
+              SSI_COPA_SOURCE_DIGEST: ${{ parameters.sourceDigest }}
+              SSI_COPA_CANONICAL_RECEIPT_CONTENT_DIGEST: ${{ parameters.canonicalReceiptContentDigest }}
+              SSI_COPA_OUTPUT_REPOSITORY: ${{ parameters.outputRepository }}
+              SSI_COPA_OUTPUT_TAG: ${{ parameters.outputTag }}
+              SSI_COPA_EXECUTE_REMEDIATION: ${{ parameters.executeRemediation }}
+
+          - script: |
+              set -euo pipefail
+              umask 077
+
+              RUN_DIR="$(Pipeline.Workspace)/copa-remediation-poc"
+              EVIDENCE_DIR="${RUN_DIR}/evidence"
+              REPORT_CONTEXT="${RUN_DIR}/report-context"
+              EXECUTE_REMEDIATION="$(printf '%s' "${SSI_COPA_EXECUTE_REMEDIATION:?SSI_COPA_EXECUTE_REMEDIATION is required}" | tr '[:upper:]' '[:lower:]')"
+              CANONICAL_REPORT="${REPORT_CONTEXT}/canonical-trivy.json"
+
+              if [[ "${EXECUTE_REMEDIATION}" != 'true' && "${EXECUTE_REMEDIATION}" != 'false' ]]; then
+                echo 'executeRemediation must resolve to true or false.'
+                exit 2
+              fi
+              echo "Normalized remediation execution mode: ${EXECUTE_REMEDIATION}"
+
+              # Azure Pipeline script steps do not share shell exports. Reconstruct
+              # the audited context here before either the prepare-only or execution
+              # path reads it.
+              if [[ ! -s "${CANONICAL_REPORT}" ]]; then
+                echo 'The validated canonical-trivy.json is not available to the Copa worker step.'
+                exit 2
+              fi
+              CANONICAL_DIGEST="sha256:$(sha256sum "${CANONICAL_REPORT}" | awk '{print $1}')"
+              EXPECTED_CANONICAL_DIGEST="${SSI_COPA_CANONICAL_RECEIPT_CONTENT_DIGEST:?SSI_COPA_CANONICAL_RECEIPT_CONTENT_DIGEST is required}"
+              if [[ "${CANONICAL_DIGEST}" != "${EXPECTED_CANONICAL_DIGEST}" ]]; then
+                echo 'Canonical report bytes changed after input validation. Refusing to continue.'
+                exit 2
+              fi
+              mkdir -p "${EVIDENCE_DIR}"
+              export SSI_COPA_CANONICAL_REPORT_PATH="${CANONICAL_REPORT}"
+              export SSI_COPA_CANONICAL_DIGEST="${CANONICAL_DIGEST}"
+              export SSI_COPA_EVIDENCE_DIR="${EVIDENCE_DIR}"
+              export SSI_COPA_HARBOR_HOST="${HARBOR_HOST:?HARBOR_HOST is required}"
+              export SSI_COPA_HARBOR_PROJECT="${HARBOR_PROJECT:?HARBOR_PROJECT is required}"
+              export SSI_COPA_FRONTEND_IMAGE="${COPA_FRONTEND_IMAGE:?COPA_FRONTEND_IMAGE is required}"
+              export SSI_COPA_FRONTEND_VERSION="${COPA_FRONTEND_VERSION:?COPA_FRONTEND_VERSION is required}"
+
+              if [[ "${EXECUTE_REMEDIATION}" != 'true' ]]; then
+                node - <<'NODE'
+              const fs = require('node:fs');
+              const path = require('node:path');
+              const input = JSON.parse(fs.readFileSync(path.join(process.env.SSI_COPA_EVIDENCE_DIR, 'prepared-remediation-input.json'), 'utf8'));
+              const result = {
+                ...input,
+                result: {
+                  status: 'prepared',
+                  patchAttempted: false,
+                  registryWriteAttempted: false,
+                  verificationScanAttempted: false,
+                  approvedPublishAttempted: false,
+                  nextGate: 'Re-run manually with executeRemediation=true after the isolated PoC worker change approval.',
+                },
+              };
+              fs.writeFileSync(path.join(process.env.SSI_COPA_EVIDENCE_DIR, 'remediation-result.json'), `${JSON.stringify(result, null, 2)}\n`);
+              console.log('Prepare-only run completed. No Copa patch, registry write, or re-scan was attempted.');
+              NODE
+                exit 0
+              fi
+
+              SOURCE_REPOSITORY="${SSI_COPA_SOURCE_REPOSITORY:?SSI_COPA_SOURCE_REPOSITORY is required}"
+              SOURCE_DIGEST="${SSI_COPA_SOURCE_DIGEST:?SSI_COPA_SOURCE_DIGEST is required}"
+              OUTPUT_REPOSITORY="${SSI_COPA_OUTPUT_REPOSITORY:?SSI_COPA_OUTPUT_REPOSITORY is required}"
+              if [[ "${OUTPUT_REPOSITORY}" == approved || "${OUTPUT_REPOSITORY}" == approved/* || "${OUTPUT_REPOSITORY}" == *..* ]]; then
+                echo 'outputRepository must not be in the approved catalog (approved/); no registry write was attempted.'
+                exit 2
+              fi
+              OUTPUT_TAG="${SSI_COPA_OUTPUT_TAG:?SSI_COPA_OUTPUT_TAG is required}"
+              HARBOR_CA_CERT_PATH="${SSI_COPA_HARBOR_CA_CERT_PATH:?SSI_COPA_HARBOR_CA_CERT_PATH is required}"
+              HARBOR_USERNAME_RAW="${HARBOR_ROBOT_USERNAME:?HARBOR_ROBOT_USERNAME is required}"
+              : "${HARBOR_ROBOT_SECRET:?HARBOR_ROBOT_SECRET is required}"
+              HARBOR_USERNAME="$(printf '%s' "${HARBOR_USERNAME_RAW}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+              if [[ -z "${HARBOR_USERNAME}" ]]; then
+                echo 'HARBOR_ROBOT_USERNAME is empty after removing surrounding whitespace.'
+                exit 3
+              fi
+              if [[ "${HARBOR_USERNAME}" != "${HARBOR_USERNAME_RAW}" ]]; then
+                echo 'Removed surrounding whitespace from HARBOR_ROBOT_USERNAME for this job.'
+              fi
+              SOURCE_REFERENCE="${HARBOR_HOST}/${HARBOR_PROJECT}/${SOURCE_REPOSITORY}@${SOURCE_DIGEST}"
+              TARGET_REFERENCE="${HARBOR_HOST}/${HARBOR_PROJECT}/${OUTPUT_REPOSITORY}:${OUTPUT_TAG}"
+              CA_FILE="${RUN_DIR}/certs/harbor-ca.pem"
+              BUILDER_NAME="ssi-copa-${BUILD_BUILDID:-manual}"
+              BRIDGE_NETWORK="ssi-copa-net-${BUILD_BUILDID:-manual}"
+              BRIDGE_REGISTRY_CONTAINER="ssi-copa-registry-${BUILD_BUILDID:-manual}"
+              BRIDGE_REGISTRY_HOST='copa-registry:5000'
+              BRIDGE_SOURCE_TAG="source-${SOURCE_DIGEST#sha256:}"
+              BRIDGE_SOURCE_REFERENCE="${BRIDGE_REGISTRY_HOST}/ssi/${SOURCE_REPOSITORY}:${BRIDGE_SOURCE_TAG}"
+              BRIDGE_TARGET_REFERENCE="${BRIDGE_REGISTRY_HOST}/ssi/${OUTPUT_REPOSITORY}:${OUTPUT_TAG}"
+              BRIDGE_SOURCE_REPOSITORY="${BRIDGE_REGISTRY_HOST}/ssi/${SOURCE_REPOSITORY}"
+              BRIDGE_TARGET_REPOSITORY="${BRIDGE_REGISTRY_HOST}/ssi/${OUTPUT_REPOSITORY}"
+              CONFIG_DIR="${RUN_DIR}/config-integrity"
+              CONFIG_TOOL="${BUILD_SOURCESDIRECTORY:?BUILD_SOURCESDIRECTORY is required}/scripts/image-config-integrity.mjs"
+              BUILDER_CREATED=false
+              BRIDGE_NETWORK_CREATED=false
+              BRIDGE_REGISTRY_CREATED=false
+
+              cleanup() {
+                if [[ "${BUILDER_CREATED}" == 'true' ]]; then
+                  docker buildx rm --force "${BUILDER_NAME}" >/dev/null 2>&1 || true
+                fi
+                if [[ "${BRIDGE_REGISTRY_CREATED}" == 'true' ]]; then
+                  docker rm --force "${BRIDGE_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+                fi
+                if [[ "${BRIDGE_NETWORK_CREATED}" == 'true' ]]; then
+                  docker network rm "${BRIDGE_NETWORK}" >/dev/null 2>&1 || true
+                fi
+                rm -rf "${RUN_DIR}/docker" "${RUN_DIR}/regctl" "${RUN_DIR}/certs" "${RUN_DIR}/cache" "${RUN_DIR}/buildkitd.toml" "${CONFIG_DIR}"
+              }
+              trap cleanup EXIT
+
+              if ! command -v docker >/dev/null 2>&1 || ! docker buildx version >/dev/null 2>&1; then
+                echo 'Docker Buildx is required for the isolated Copa frontend worker.'
+                exit 1
+              fi
+              if [[ ! -r "${CONFIG_TOOL}" ]]; then
+                echo 'The image configuration integrity tool is missing from the SSI checkout.'
+                exit 1
+              fi
+
+              mkdir -p "${RUN_DIR}/docker" "${RUN_DIR}/certs" "${RUN_DIR}/cache"
+              chmod 700 "${RUN_DIR}/docker"
+              if [[ "${HARBOR_CA_CERT_PATH}" == 'system' ]]; then
+                for candidate in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+                  if [[ -r "${candidate}" ]]; then
+                    cp "${candidate}" "${CA_FILE}"
+                    break
+                  fi
+                done
+              elif [[ -r "${HARBOR_CA_CERT_PATH}" ]]; then
+                cp "${HARBOR_CA_CERT_PATH}" "${CA_FILE}"
+              else
+                echo 'Configured Harbor CA PEM path is not readable on this worker.'
+                exit 2
+              fi
+
+              if [[ ! -s "${CA_FILE}" ]]; then
+                echo 'No readable system CA bundle or Harbor CA PEM is available for the BuildKit worker.'
+                exit 2
+              fi
+              chmod 600 "${CA_FILE}"
+
+              harbor_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 --cacert "${CA_FILE}" -o /dev/null -w '%{http_code}' "https://${HARBOR_HOST}/v2/" || true)"
+              if [[ "${harbor_status}" != '200' && "${harbor_status}" != '401' && "${harbor_status}" != '403' ]]; then
+                echo "Harbor TLS validation failed with HTTP ${harbor_status}. Refusing to use insecure transport."
+                exit 2
+              fi
+
+              export DOCKER_CONFIG="${RUN_DIR}/docker"
+
+              echo 'Authenticating the isolated Docker client to Harbor.'
+              if ! printf '%s' "${HARBOR_ROBOT_SECRET}" | docker --config "${DOCKER_CONFIG}" login \
+                "${HARBOR_HOST}" \
+                --username "${HARBOR_USERNAME}" \
+                --password-stdin >/dev/null; then
+                echo "Harbor login failed. Verify this pipeline's robot username/secret variables and project membership."
+                exit 3
+              fi
+
+              # BuildKit currently has a known private-registry authentication
+              # failure mode even when its client session forwards valid credentials.
+              # Stage the digest-pinned source through a loopback-only, job-scoped
+              # registry, then copy the verified output back to Harbor with regctl.
+              mkdir -p "${RUN_DIR}/regctl"
+              chmod 700 "${RUN_DIR}/regctl"
+              docker network create "${BRIDGE_NETWORK}" >/dev/null
+              BRIDGE_NETWORK_CREATED=true
+              docker run --detach \
+                --name "${BRIDGE_REGISTRY_CONTAINER}" \
+                --network "${BRIDGE_NETWORK}" \
+                --network-alias copa-registry \
+                --publish '127.0.0.1::5000' \
+                "${LOCAL_REGISTRY_IMAGE}" >/dev/null
+              BRIDGE_REGISTRY_CREATED=true
+
+              BRIDGE_REGISTRY_PORT="$(docker port "${BRIDGE_REGISTRY_CONTAINER}" 5000/tcp | awk -F: 'NR == 1 { print $NF }')"
+              if [[ ! "${BRIDGE_REGISTRY_PORT}" =~ ^[0-9]+$ ]]; then
+                echo 'Unable to determine the loopback port for the job-scoped OCI registry.'
+                exit 4
+              fi
+              bridge_ready=false
+              for _ in $(seq 1 20); do
+                if curl --silent --show-error --fail "http://127.0.0.1:${BRIDGE_REGISTRY_PORT}/v2/" >/dev/null 2>&1; then
+                  bridge_ready=true
+                  break
+                fi
+                sleep 1
+              done
+              if [[ "${bridge_ready}" != 'true' ]]; then
+                echo 'The job-scoped OCI registry did not become ready.'
+                docker logs "${BRIDGE_REGISTRY_CONTAINER}" 2>&1 | tail -n 40 || true
+                exit 4
+              fi
+
+              regctl() {
+                docker run --interactive --rm \
+                  --network "${BRIDGE_NETWORK}" \
+                  --add-host "${HARBOR_HOST}:${HARBOR_HOST_IP}" \
+                  --user "$(id -u):$(id -g)" \
+                  -e DOCKER_CONFIG=/work/docker \
+                  -e REGCTL_CONFIG=/work/regctl/config.json \
+                  -e SSL_CERT_FILE=/work/certs/harbor-ca.pem \
+                  -v "${RUN_DIR}:/work" \
+                  "${REGCTL_IMAGE}" "$@"
+              }
+
+              config_tool() {
+                node "${CONFIG_TOOL}" "$@"
+              }
+
+              # Resolves <repository>@<digest> to one platform image manifest and its config
+              # blob, checking every downloaded byte against its digest. Writes
+              # <name>-top.json, <name>-manifest.json and <name>-config.json to CONFIG_DIR.
+              fetch_image_config() {
+                local repository="$1" digest="$2" platform="$3" name="$4"
+                local image_digest config_digest
+                regctl manifest get "${repository}@${digest}" --format raw-body > "${CONFIG_DIR}/${name}-top.json"
+                config_tool verify-digest --file "${CONFIG_DIR}/${name}-top.json" --digest "${digest}"
+                image_digest="$(config_tool select-image-manifest --manifest "${CONFIG_DIR}/${name}-top.json" --platform "${platform}")"
+                regctl manifest get "${repository}@${image_digest}" --format raw-body > "${CONFIG_DIR}/${name}-manifest.json"
+                config_tool verify-digest --file "${CONFIG_DIR}/${name}-manifest.json" --digest "${image_digest}"
+                config_digest="$(config_tool config-digest --manifest "${CONFIG_DIR}/${name}-manifest.json")"
+                regctl blob get "${repository}" "${config_digest}" > "${CONFIG_DIR}/${name}-config.json"
+                config_tool verify-digest --file "${CONFIG_DIR}/${name}-config.json" --digest "${config_digest}"
+              }
+
+              regctl registry set "${BRIDGE_REGISTRY_HOST}" --tls disabled
+              if ! printf '%s' "${HARBOR_ROBOT_SECRET}" | regctl registry login \
+                "${HARBOR_HOST}" \
+                --user "${HARBOR_USERNAME}" \
+                --pass-stdin; then
+                echo 'regctl could not authenticate to Harbor with the validated robot credentials.'
+                exit 4
+              fi
+              chmod 600 "${RUN_DIR}/regctl/config.json"
+
+              echo 'Validating authenticated access to the immutable Harbor source.'
+              REGCTL_SOURCE_DIGEST="$(regctl image digest "${SOURCE_REFERENCE}")"
+              if [[ "${REGCTL_SOURCE_DIGEST}" != "${SOURCE_DIGEST}" ]]; then
+                echo 'The authenticated registry client could not resolve the approved source digest exactly.'
+                exit 4
+              fi
+
+              echo 'Staging the immutable Harbor source in the job-scoped registry.'
+              regctl image copy "${SOURCE_REFERENCE}" "${BRIDGE_SOURCE_REFERENCE}"
+              BRIDGE_SOURCE_DIGEST="$(regctl image digest "${BRIDGE_SOURCE_REFERENCE}")"
+              if [[ "${BRIDGE_SOURCE_DIGEST}" != "${SOURCE_DIGEST}" ]]; then
+                echo 'The staged source digest does not match the audited Harbor source digest.'
+                exit 4
+              fi
+              BRIDGE_SOURCE_IMMUTABLE_REFERENCE="${BRIDGE_REGISTRY_HOST}/ssi/${SOURCE_REPOSITORY}@${BRIDGE_SOURCE_DIGEST}"
+
+              cat > "${RUN_DIR}/buildkitd.toml" <<EOF
+              [registry."${BRIDGE_REGISTRY_HOST}"]
+                http = true
+              EOF
+
+              echo "Creating temporary isolated BuildKit worker: ${BUILDER_NAME}"
+              docker buildx create \
+                --name "${BUILDER_NAME}" \
+                --driver docker-container \
+                --driver-opt "network=${BRIDGE_NETWORK}" \
+                --buildkitd-config "${RUN_DIR}/buildkitd.toml" \
+                --use \
+                --bootstrap
+              BUILDER_CREATED=true
+              docker buildx inspect "${BUILDER_NAME}"
+
+              echo "Patching immutable source into dedicated PoC output tag: ${TARGET_REFERENCE}"
+              # BuildKit v0.30+ rejects a Dockerfile that is not a regular file, so
+              # the Copa frontend can no longer be fed through /dev/null. Provide an
+              # empty, job-scoped regular file instead; the build definition is still
+              # derived entirely from BUILDKIT_SYNTAX and the build-args below.
+              COPA_BUILD_DEFINITION="${RUN_DIR}/copa-frontend.Dockerfile"
+              : > "${COPA_BUILD_DEFINITION}"
+              docker buildx build \
+                --builder "${BUILDER_NAME}" \
+                --build-arg "BUILDKIT_SYNTAX=${COPA_FRONTEND_IMAGE}" \
+                --build-arg "image=${BRIDGE_SOURCE_IMMUTABLE_REFERENCE}" \
+                --build-arg 'report=canonical-trivy.json' \
+                --build-arg 'scanner=trivy' \
+                --build-arg 'pkg-types=os' \
+                --build-context "report=${REPORT_CONTEXT}" \
+                --metadata-file "${EVIDENCE_DIR}/copa-build-metadata.json" \
+                --output "type=image,name=${BRIDGE_TARGET_REFERENCE},push=true" \
+                -f "${COPA_BUILD_DEFINITION}" \
+                "${REPORT_CONTEXT}"
+
+              COPA_OUTPUT_DIGEST="$(regctl image digest "${BRIDGE_TARGET_REFERENCE}")"
+              if [[ ! "${COPA_OUTPUT_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'The job-scoped registry did not return a valid patched image digest.'
+                exit 4
+              fi
+
+              # Image configuration integrity gate (fail-closed). Copa only adds a package
+              # layer; the patched image must start and run exactly like the source. The Copa
+              # frontend output can lose the runtime config (Entrypoint, Cmd, ExposedPorts,
+              # StopSignal, ...), which the vulnerability re-scan cannot detect. Compare the
+              # runtime config with the source; if it differs, push a metadata-only restore
+              # (same layers, source runtime config) and verify the final image again.
+              echo 'Verifying that the Copa output keeps the source image runtime configuration.'
+              mkdir -p "${CONFIG_DIR}"
+              fetch_image_config "${BRIDGE_TARGET_REPOSITORY}" "${COPA_OUTPUT_DIGEST}" '' copa-output
+              OUTPUT_PLATFORM="$(config_tool platform --config "${CONFIG_DIR}/copa-output-config.json")"
+              fetch_image_config "${BRIDGE_SOURCE_REPOSITORY}" "${SOURCE_DIGEST}" "${OUTPUT_PLATFORM}" source
+              CONFIG_STATUS="$(config_tool plan \
+                --source-config "${CONFIG_DIR}/source-config.json" \
+                --output-config "${CONFIG_DIR}/copa-output-config.json" \
+                --output-manifest "${CONFIG_DIR}/copa-output-manifest.json" \
+                --out-dir "${CONFIG_DIR}")"
+              BRIDGE_TARGET_DIGEST="${COPA_OUTPUT_DIGEST}"
+              if [[ "${CONFIG_STATUS}" == 'restore-required' ]]; then
+                CHANGED_CONFIG_FIELDS="$(config_tool field --file "${CONFIG_DIR}/plan.json" --name changedFields)"
+                PLANNED_CONFIG_DIGEST="$(config_tool field --file "${CONFIG_DIR}/plan.json" --name restoredConfigDigest)"
+                PLANNED_MANIFEST_DIGEST="$(config_tool field --file "${CONFIG_DIR}/plan.json" --name restoredManifestDigest)"
+                PLANNED_MANIFEST_MEDIA_TYPE="$(config_tool field --file "${CONFIG_DIR}/plan.json" --name restoredManifestMediaType)"
+                echo "##vso[task.logissue type=warning]The Copa output lost the source runtime configuration (${CHANGED_CONFIG_FIELDS}). Restoring it from the source image without changing any layer."
+                RESTORED_CONFIG_DIGEST="$(regctl blob put "${BRIDGE_TARGET_REPOSITORY}" < "${CONFIG_DIR}/restored-config.json")"
+                if [[ "${RESTORED_CONFIG_DIGEST}" != "${PLANNED_CONFIG_DIGEST}" ]]; then
+                  echo 'The job-scoped registry stored a different restored config blob than planned.'
+                  exit 4
+                fi
+                regctl manifest put \
+                  --content-type "${PLANNED_MANIFEST_MEDIA_TYPE}" \
+                  "${BRIDGE_TARGET_REFERENCE}" < "${CONFIG_DIR}/restored-manifest.json"
+                BRIDGE_TARGET_DIGEST="$(regctl image digest "${BRIDGE_TARGET_REFERENCE}")"
+                if [[ "${BRIDGE_TARGET_DIGEST}" != "${PLANNED_MANIFEST_DIGEST}" ]]; then
+                  echo 'The job-scoped registry did not store the planned restored manifest.'
+                  exit 4
+                fi
+              elif [[ "${CONFIG_STATUS}" != 'preserved' ]]; then
+                echo "Unexpected image configuration integrity status: ${CONFIG_STATUS}"
+                exit 4
+              fi
+              fetch_image_config "${BRIDGE_TARGET_REPOSITORY}" "${BRIDGE_TARGET_DIGEST}" "${OUTPUT_PLATFORM}" final
+              CONFIG_INTEGRITY_RESULT="$(config_tool verify \
+                --plan "${CONFIG_DIR}/plan.json" \
+                --source-config "${CONFIG_DIR}/source-config.json" \
+                --output-config "${CONFIG_DIR}/final-config.json" \
+                --output-manifest "${CONFIG_DIR}/final-manifest.json" \
+                --copa-output-digest "${COPA_OUTPUT_DIGEST}" \
+                --output-digest "${BRIDGE_TARGET_DIGEST}" \
+                --out "${EVIDENCE_DIR}/config-integrity.json")"
+              echo "Image configuration integrity: ${CONFIG_INTEGRITY_RESULT} (${OUTPUT_PLATFORM}, ${BRIDGE_TARGET_DIGEST})."
+
+              echo "Copying verified Copa output to the dedicated Harbor PoC tag: ${TARGET_REFERENCE}"
+              regctl image copy "${BRIDGE_TARGET_REFERENCE}" "${TARGET_REFERENCE}"
+
+              TARGET_DIGEST="$(regctl image digest "${TARGET_REFERENCE}")"
+              if [[ ! "${TARGET_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'Harbor did not return a valid immutable digest for the copied PoC output tag.'
+                exit 1
+              fi
+              if [[ "${TARGET_DIGEST}" != "${BRIDGE_TARGET_DIGEST}" ]]; then
+                echo 'Harbor output digest differs from the patched digest produced by Copa.'
+                exit 4
+              fi
+              TARGET_IMMUTABLE_REFERENCE="${HARBOR_HOST}/${HARBOR_PROJECT}/${OUTPUT_REPOSITORY}@${TARGET_DIGEST}"
+
+              docker run --rm \
+                --network host \
+                --add-host "${HARBOR_HOST}:${HARBOR_HOST_IP}" \
+                --user "$(id -u):$(id -g)" \
+                -e DOCKER_CONFIG=/work/docker \
+                -e TRIVY_CACHE_DIR=/work/cache \
+                -e SSL_CERT_FILE=/work/certs/harbor-ca.pem \
+                -v "${RUN_DIR}:/work" \
+                "${TRIVY_IMAGE}" image \
+                --image-src remote \
+                --scanners vuln \
+                --pkg-types os \
+                --ignore-unfixed \
+                --format json \
+                --output /work/after-trivy.json \
+                --quiet \
+                --timeout 15m \
+                "${TARGET_IMMUTABLE_REFERENCE}"
+
+              export SSI_COPA_TARGET_REFERENCE="${TARGET_REFERENCE}"
+              export SSI_COPA_TARGET_DIGEST="${TARGET_DIGEST}"
+              export SSI_COPA_TARGET_IMMUTABLE_REFERENCE="${TARGET_IMMUTABLE_REFERENCE}"
+              export SSI_COPA_AFTER_REPORT_PATH="${RUN_DIR}/after-trivy.json"
+              node <<'NODE'
+              const fs = require('node:fs');
+              const path = require('node:path');
+              const before = JSON.parse(fs.readFileSync(process.env.SSI_COPA_CANONICAL_REPORT_PATH, 'utf8'));
+              const after = JSON.parse(fs.readFileSync(process.env.SSI_COPA_AFTER_REPORT_PATH, 'utf8'));
+              const targetDigest = process.env.SSI_COPA_TARGET_DIGEST;
+              const afterReferences = [after.ArtifactName, ...(after.Metadata?.RepoDigests || [])]
+                .filter(Boolean)
+                .map(String);
+              const afterIsBoundToTarget = afterReferences.some((reference) => reference.includes(targetDigest));
+              const afterHasOnlyOsPackages = (after.Results || []).every((result) => result.Class === 'os-pkgs');
+              if (Number(after.SchemaVersion) !== 2 || !afterIsBoundToTarget || !afterHasOnlyOsPackages) {
+                throw new Error('Verification scan must be SchemaVersion 2, bound to the patched immutable digest, and OS-only.');
+              }
+              const configIntegrity = JSON.parse(fs.readFileSync(path.join(process.env.SSI_COPA_EVIDENCE_DIR, 'config-integrity.json'), 'utf8'));
+              if (configIntegrity.verified !== true || configIntegrity.outputDigest !== targetDigest) {
+                throw new Error('Image configuration integrity evidence must be verified and bound to the patched immutable digest.');
+              }
+              const flatten = (report) => (report.Results || []).flatMap((result) =>
+                (result.Vulnerabilities || []).map((finding) => ({ ...finding, class: result.Class || '' })),
+              );
+              const key = (finding) => `${finding.VulnerabilityID || ''}|${finding.PkgName || ''}`;
+              const beforeFindings = flatten(before);
+              const afterFindings = flatten(after);
+              const afterKeys = new Set(afterFindings.map(key));
+              const fixed = beforeFindings.filter((finding) => !afterKeys.has(key(finding)));
+              const remaining = beforeFindings.filter((finding) => afterKeys.has(key(finding)));
+              const severityCounts = (findings) => findings.reduce((counts, finding) => {
+                const severity = String(finding.Severity || 'UNKNOWN').toLowerCase();
+                counts[severity] = (counts[severity] || 0) + 1;
+                return counts;
+              }, { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 });
+              const beforeSeverity = severityCounts(beforeFindings);
+              const afterSeverity = severityCounts(afterFindings);
+              const verificationPassed = fixed.length > 0
+                && afterFindings.length < beforeFindings.length
+                && (afterSeverity.critical + afterSeverity.high) <= (beforeSeverity.critical + beforeSeverity.high);
+              const result = {
+                contractVersion: 'ssi.copa-remediation-poc/v1alpha1',
+                mode: 'approved-poc-execution',
+                generatedAt: new Date().toISOString(),
+                source: {
+                  immutableReference: `${process.env.SSI_COPA_HARBOR_HOST}/${process.env.SSI_COPA_HARBOR_PROJECT}/${process.env.SSI_COPA_SOURCE_REPOSITORY}@${process.env.SSI_COPA_SOURCE_DIGEST}`,
+                  digest: process.env.SSI_COPA_SOURCE_DIGEST,
+                },
+                canonicalInput: {
+                  contentDigest: process.env.SSI_COPA_CANONICAL_DIGEST,
+                  trivyVersion: before.Trivy?.Version || '',
+                  scope: 'os-packages-only',
+                  findings: beforeFindings.length,
+                },
+                output: {
+                  tagReference: process.env.SSI_COPA_TARGET_REFERENCE,
+                  immutableReference: process.env.SSI_COPA_TARGET_IMMUTABLE_REFERENCE,
+                  digest: process.env.SSI_COPA_TARGET_DIGEST,
+                  approvedPublishAttempted: false,
+                },
+                engine: {
+                  name: 'Copacetic BuildKit frontend',
+                  version: process.env.SSI_COPA_FRONTEND_VERSION,
+                  image: process.env.SSI_COPA_FRONTEND_IMAGE,
+                  packageScope: 'os',
+                },
+                verification: {
+                  scanner: 'Trivy',
+                  reScanPatchedDigest: true,
+                  before: { findings: beforeFindings.length, severity: beforeSeverity },
+                  after: { findings: afterFindings.length, severity: afterSeverity },
+                  fixed: fixed.map((finding) => ({ cve: finding.VulnerabilityID || '', package: finding.PkgName || '', fixedVersion: finding.FixedVersion || '' })),
+                  remaining: remaining.map((finding) => ({ cve: finding.VulnerabilityID || '', package: finding.PkgName || '' })),
+                  passed: verificationPassed,
+                },
+                configIntegrity,
+                result: {
+                  status: verificationPassed ? 'verified-poc-output' : 'verification-failed',
+                  patchAttempted: true,
+                  registryWriteAttempted: true,
+                  verificationScanAttempted: true,
+                  approvedPublishAttempted: false,
+                },
+              };
+              fs.writeFileSync(path.join(process.env.SSI_COPA_EVIDENCE_DIR, 'remediation-result.json'), `${JSON.stringify(result, null, 2)}\n`);
+              console.log(`Verification summary: before=${beforeFindings.length}, after=${afterFindings.length}, fixed=${fixed.length}, remaining=${remaining.length}.`);
+              if (!verificationPassed) {
+                throw new Error('Verification gate failed: the patched output did not reduce findings without increasing Critical + High findings.');
+              }
+              NODE
+            displayName: 'Patch with Copa frontend and re-scan immutable output'
+            env:
+              SSI_COPA_SOURCE_REPOSITORY: ${{ parameters.sourceRepository }}
+              SSI_COPA_SOURCE_DIGEST: ${{ parameters.sourceDigest }}
+              SSI_COPA_CANONICAL_RECEIPT_CONTENT_DIGEST: ${{ parameters.canonicalReceiptContentDigest }}
+              SSI_COPA_OUTPUT_REPOSITORY: ${{ parameters.outputRepository }}
+              SSI_COPA_OUTPUT_TAG: ${{ parameters.outputTag }}
+              SSI_COPA_HARBOR_CA_CERT_PATH: ${{ parameters.harborCaCertPath }}
+              SSI_COPA_EXECUTE_REMEDIATION: ${{ parameters.executeRemediation }}
+              HARBOR_ROBOT_USERNAME: $(HARBOR_ROBOT_USERNAME)
+              HARBOR_ROBOT_SECRET: $(HARBOR_ROBOT_SECRET)
+
+          - script: |
+              set -euo pipefail
+
+              if [ "${SSI_COPA_EXECUTE_REMEDIATION,,}" != "true" ]; then
+                echo "Prepare-only run: worker evidence delivery is not required."
+                exit 0
+              fi
+
+              node <<'NODE'
+              const fs = require('node:fs');
+              const http = require('node:http');
+              const https = require('node:https');
+              const path = require('node:path');
+              const { createHash, createHmac, randomBytes } = require('node:crypto');
+
+              const required = (name, { secret = false } = {}) => {
+                const value = String(process.env[name] || '');
+                if (!value || value.includes('$(')) {
+                  throw new Error(`${secret ? 'Secret' : 'Variable'} ${name} is required for worker evidence delivery.`);
+                }
+                return value;
+              };
+              const jobId = required('SSI_COPA_REMEDIATION_JOB_ID');
+              if (!/^RM-DRY-[0-9]{4,}$/.test(jobId)) {
+                throw new Error('SSI_COPA_REMEDIATION_JOB_ID must identify an existing RM-DRY job.');
+              }
+
+              const secret = required('SSI_REMEDIATION_EVIDENCE_HMAC_SECRET', { secret: true });
+              if (Buffer.byteLength(secret, 'utf8') < 32) {
+                throw new Error('SSI_REMEDIATION_EVIDENCE_HMAC_SECRET must contain at least 32 bytes.');
+              }
+
+              const baseUrl = new URL(required('SSI_API_BASE_URL'));
+              if (baseUrl.username || baseUrl.password || baseUrl.search || baseUrl.hash) {
+                throw new Error('SSI_API_BASE_URL must not contain credentials, query parameters, or a fragment.');
+              }
+              const allowHttp = String(process.env.SSI_API_ALLOW_HTTP || '').toLowerCase() === 'true';
+              if (baseUrl.protocol !== 'https:' && !(allowHttp && baseUrl.protocol === 'http:')) {
+                throw new Error('SSI_API_BASE_URL must use HTTPS unless SSI_API_ALLOW_HTTP=true is explicitly set for the internal PoC.');
+              }
+
+              const workerId = [process.env.SSI_EVIDENCE_WORKER_ID, process.env.SSI_EVIDENCE_WORKER_MACHINE]
+                .filter(Boolean)
+                .join(':')
+                .replace(/[^A-Za-z0-9._:-]/g, '-')
+                .slice(0, 128);
+              if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workerId)) {
+                throw new Error('Azure agent identity could not be normalized for evidence signing.');
+              }
+
+              const evidencePath = path.join(required('SSI_EVIDENCE_DIR'), 'remediation-result.json');
+              const evidence = JSON.parse(fs.readFileSync(evidencePath, 'utf8'));
+              if (evidence.result?.status !== 'verified-poc-output' || evidence.verification?.passed !== true) {
+                throw new Error('Only a successfully verified remediation result can be delivered to SSI.');
+              }
+              const body = JSON.stringify(evidence);
+              const contentDigest = `sha256:${createHash('sha256').update(body).digest('hex')}`;
+              const endpoint = new URL(baseUrl);
+              endpoint.pathname = `${endpoint.pathname.replace(/\/$/, '')}/remediation/${encodeURIComponent(jobId)}/worker-evidence`;
+              const pendingEvidencePath = path.join(
+                required('SSI_EVIDENCE_DIR'),
+                'api-evidence-delivery-pending.json',
+              );
+              const writeJsonAtomic = (targetPath, payload) => {
+                const temporaryPath = `${targetPath}.tmp-${process.pid}`;
+                fs.writeFileSync(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, {
+                  mode: 0o600,
+                });
+                fs.renameSync(temporaryPath, targetPath);
+              };
+              const writePendingDelivery = ({ attempts, code, message }) => {
+                writeJsonAtomic(pendingEvidencePath, {
+                  contractVersion: 'ssi.worker-evidence-delivery-pending/v1',
+                  status: 'pending',
+                  retryable: true,
+                  recordedAt: new Date().toISOString(),
+                  jobId,
+                  workerId,
+                  contentDigest,
+                  callbackEndpoint: endpoint.toString(),
+                  attempts,
+                  reason: {
+                    code: String(code || 'ECALLBACKUNREACHABLE'),
+                    message: String(message || 'SSI callback is temporarily unreachable.').slice(0, 500),
+                  },
+                });
+              };
+              const removePendingDelivery = () => {
+                if (fs.existsSync(pendingEvidencePath)) {
+                  fs.rmSync(pendingEvidencePath, { force: true });
+                }
+              };
+              const callbackReachable =
+                String(process.env.SSI_CALLBACK_REACHABLE || '').toLowerCase() === 'true';
+
+              const uuidBytes = randomBytes(16);
+              uuidBytes[6] = (uuidBytes[6] & 0x0f) | 0x40;
+              uuidBytes[8] = (uuidBytes[8] & 0x3f) | 0x80;
+              const uuidHex = uuidBytes.toString('hex');
+              const correlationId = [
+                uuidHex.slice(0, 8),
+                uuidHex.slice(8, 12),
+                uuidHex.slice(12, 16),
+                uuidHex.slice(16, 20),
+                uuidHex.slice(20),
+              ].join('-');
+
+              const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+              const isTransientStatus = (status) => [408, 425, 429].includes(status) || status >= 500;
+              const requestJson = (url, { headers, requestBody, timeoutMs }) =>
+                new Promise((resolve, reject) => {
+                  const transport = url.protocol === 'https:' ? https : http;
+                  let settled = false;
+                  const finish = (callback, value) => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(deadline);
+                    callback(value);
+                  };
+                  const request = transport.request(
+                    url,
+                    {
+                      method: 'POST',
+                      headers: {
+                        ...headers,
+                        'Content-Length': Buffer.byteLength(requestBody),
+                      },
+                    },
+                    (response) => {
+                      const chunks = [];
+                      let responseBytes = 0;
+                      response.on('data', (chunk) => {
+                        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                        responseBytes += buffer.length;
+                        if (responseBytes > 1024 * 1024) {
+                          const error = new Error('SSI API response exceeded the 1 MiB safety limit.');
+                          error.transient = false;
+                          response.destroy(error);
+                          finish(reject, error);
+                          return;
+                        }
+                        chunks.push(buffer);
+                      });
+                      response.on('end', () => {
+                        finish(resolve, {
+                          status: response.statusCode || 0,
+                          headers: response.headers,
+                          text: Buffer.concat(chunks).toString('utf8'),
+                        });
+                      });
+                      response.on('error', (error) => finish(reject, error));
+                    },
+                  );
+
+                  const deadline = setTimeout(() => {
+                    const error = new Error(`SSI worker evidence request timed out after ${timeoutMs} ms.`);
+                    error.code = 'ETIMEDOUT';
+                    error.transient = true;
+                    request.destroy(error);
+                    finish(reject, error);
+                  }, timeoutMs);
+                  request.on('error', (error) => finish(reject, error));
+                  request.end(requestBody);
+                });
+
+              async function deliver() {
+                if (!callbackReachable) {
+                  writePendingDelivery({
+                    attempts: 0,
+                    code: 'EPREFLIGHTUNREACHABLE',
+                    message:
+                      'The remediation worker could not reach the SSI API during preflight. ' +
+                      'The signed evidence payload remains available for controlled retry.',
+                  });
+                  console.log(
+                    '##vso[task.logissue type=warning]SSI callback is unreachable; ' +
+                      'worker evidence delivery was recorded as pending.',
+                  );
+                  return;
+                }
+
+                let lastError;
+                for (let attempt = 1; attempt <= 3; attempt += 1) {
+                  const timestamp = Math.floor(Date.now() / 1000);
+                  const payload = ['ssi-remediation-evidence-v1', timestamp, jobId, workerId, contentDigest].join('\n');
+                  const signature = createHmac('sha256', secret).update(payload).digest('hex');
+
+                  try {
+                    const response = await requestJson(endpoint, {
+                      headers: {
+                        'Content-Type': 'application/json',
+                        'X-Correlation-ID': correlationId,
+                        'X-SSI-Evidence-Version': 'v1',
+                        'X-SSI-Evidence-Timestamp': String(timestamp),
+                        'X-SSI-Evidence-Content-SHA256': contentDigest,
+                        'X-SSI-Evidence-Worker-ID': workerId,
+                        'X-SSI-Evidence-Signature': `sha256=${signature}`,
+                      },
+                      requestBody: body,
+                      timeoutMs: 15000,
+                    });
+                    let responseBody = {};
+                    try {
+                      responseBody = response.text ? JSON.parse(response.text) : {};
+                    } catch {
+                      responseBody = {};
+                    }
+
+                    if (response.status >= 200 && response.status < 300) {
+                      const receipt = {
+                        contractVersion: 'ssi.worker-evidence-receipt/v1',
+                        deliveredAt: new Date().toISOString(),
+                        correlationId,
+                        jobId,
+                        workerId,
+                        contentDigest,
+                        responseStatus: response.status,
+                        replay: String(response.headers['x-ssi-evidence-replay'] || '').toLowerCase() === 'true',
+                        remediationJobId: responseBody.id || '',
+                        remediationStatus: responseBody.status || '',
+                      };
+                      fs.writeFileSync(
+                        path.join(process.env.SSI_EVIDENCE_DIR, 'api-evidence-receipt.json'),
+                        `${JSON.stringify(receipt, null, 2)}\n`,
+                      );
+                      removePendingDelivery();
+                      console.log(`Worker evidence accepted by SSI for ${jobId} (HTTP ${response.status}, replay=${receipt.replay}).`);
+                      return;
+                    }
+
+                    const message = String(responseBody.message || `HTTP ${response.status}`).slice(0, 300);
+                    const error = new Error(`SSI worker evidence delivery failed: ${message}`);
+                    error.transient = isTransientStatus(response.status);
+                    throw error;
+                  } catch (error) {
+                    lastError = error;
+                    const transient = error.transient !== false;
+                    if (!transient) throw error;
+                    if (attempt === 3) {
+                      writePendingDelivery({
+                        attempts: attempt,
+                        code: String(error.code || 'ECALLBACKUNREACHABLE'),
+                        message: String(error.message || error),
+                      });
+                      console.log(
+                        '##vso[task.logissue type=warning]SSI callback remained unreachable after retries; ' +
+                          'worker evidence delivery was recorded as pending.',
+                      );
+                      return;
+                    }
+                    console.log(`Evidence delivery attempt ${attempt} failed transiently; retrying.`);
+                    await sleep(attempt * 1000);
+                  }
+                }
+                throw lastError;
+              }
+
+              deliver().catch((error) => {
+                console.error(error.message);
+                process.exitCode = 1;
+              });
+              NODE
+            displayName: 'Deliver signed remediation evidence to SSI API'
+            env:
+              SSI_COPA_EXECUTE_REMEDIATION: ${{ parameters.executeRemediation }}
+              SSI_COPA_REMEDIATION_JOB_ID: ${{ parameters.remediationJobId }}
+              SSI_API_BASE_URL: $(SSI_API_BASE_URL)
+              SSI_API_ALLOW_HTTP: $(SSI_API_ALLOW_HTTP)
+              SSI_REMEDIATION_EVIDENCE_HMAC_SECRET: $(SSI_REMEDIATION_EVIDENCE_HMAC_SECRET)
+              SSI_EVIDENCE_WORKER_ID: $(Agent.Name)
+              SSI_EVIDENCE_WORKER_MACHINE: $(Agent.MachineName)
+              SSI_EVIDENCE_DIR: $(Pipeline.Workspace)/copa-remediation-poc/evidence
+              SSI_CALLBACK_REACHABLE: $(SSI_CALLBACK_REACHABLE)
+
+          - script: |
+              set -euo pipefail
+              umask 077
+
+              EVIDENCE_DIR="$(Pipeline.Workspace)/copa-remediation-poc/evidence"
+              mkdir -p "${EVIDENCE_DIR}"
+
+              export SSI_EVIDENCE_DIR="${EVIDENCE_DIR}"
+              export SSI_JOB_STATUS="$(Agent.JobStatus)"
+              export SSI_EVIDENCE_WORKER_ID="$(Agent.Name)"
+              export SSI_EVIDENCE_WORKER_MACHINE="$(Agent.MachineName)"
+              node <<'NODE'
+              const fs = require('node:fs');
+              const path = require('node:path');
+
+              const evidenceDir = String(process.env.SSI_EVIDENCE_DIR || '');
+              if (!evidenceDir) {
+                throw new Error('SSI_EVIDENCE_DIR is required');
+              }
+
+              const hasEvidence = fs
+                .readdirSync(evidenceDir, { withFileTypes: true })
+                .some((entry) => entry.isFile());
+
+              if (!hasEvidence) {
+                const payload = {
+                  schemaVersion: 1,
+                  kind: 'ssi.remediation.pipeline-diagnostic',
+                  status: 'no-evidence-produced',
+                  observedAt: new Date().toISOString(),
+                  jobStatus: String(process.env.SSI_JOB_STATUS || 'unknown'),
+                  agent: {
+                    name: String(process.env.SSI_EVIDENCE_WORKER_ID || 'unknown'),
+                    machine: String(process.env.SSI_EVIDENCE_WORKER_MACHINE || 'unknown'),
+                  },
+                };
+
+                const evidencePath = path.join(evidenceDir, 'pipeline-diagnostic.json');
+                const temporaryPath = `${evidencePath}.tmp-${process.pid}`;
+                fs.writeFileSync(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, {
+                  mode: 0o600,
+                });
+                fs.renameSync(temporaryPath, evidencePath);
+              }
+              NODE
+            displayName: 'Finalize remediation diagnostic evidence'
+            condition: succeededOrFailed()
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish remediation PoC evidence'
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/copa-remediation-poc/evidence'
+              ArtifactName: 'copa-remediation-poc-evidence'
+              publishLocation: 'Container'
+
+          - script: rm -rf "$(Pipeline.Workspace)/copa-remediation-poc"
+            displayName: 'Remove temporary remediation credentials and reports'
+            condition: always()

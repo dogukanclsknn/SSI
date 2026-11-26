@@ -1,0 +1,48 @@
+# SSI production kimlik katmanı — oauth2-proxy (Microsoft Entra ID) overlay.
+#
+# Temel compose'u DEĞİŞTİRMEZ; üstüne eklenir. Repo kökünden çalıştır:
+#
+#   docker compose -f docker-compose.yml \
+#     -f deploy/oauth2-proxy/docker-compose.oauth2-proxy.yml up -d --build
+#
+# (Yol'lar ilk -f dosyasının dizinine görecelidir; bu yüzden ./deploy/... kökten yazılır.)
+#
+# Aktive etmeden önce .env'de RBAC enforce edilmeli:
+#   SSI_RBAC_ENFORCED=true
+#   SSI_TRUST_ACTOR_HEADER=true
+#   SSI_DEV_LOGIN=false
+#   SSI_RBAC_GROUP_ROLE_MAP=<entra-grup-guid>:approver, <entra-grup-guid>:operator, ...
+# ve Entra sırları (bkz. oauth2-proxy.env.example) girilmeli.
+
+services:
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.4
+    container_name: ssi-oauth2-proxy
+    depends_on:
+      - ssi
+    command: ["--config=/etc/oauth2-proxy/oauth2-proxy.cfg"]
+    volumes:
+      - ./deploy/oauth2-proxy/oauth2-proxy.cfg:/etc/oauth2-proxy/oauth2-proxy.cfg:ro
+    environment:
+      # Sır-olmayan bağlantı bilgileri (issuer + redirect). Tenant ID .env'den gelir.
+      OAUTH2_PROXY_OIDC_ISSUER_URL: https://login.microsoftonline.com/${ENTRA_TENANT_ID:-}/v2.0
+      OAUTH2_PROXY_REDIRECT_URL: ${OAUTH2_PROXY_REDIRECT_URL:-}
+      # Sırlar — .env'de tutulur, repoya asla commit'lenmez.
+      OAUTH2_PROXY_CLIENT_ID: ${ENTRA_CLIENT_ID:-}
+      OAUTH2_PROXY_CLIENT_SECRET: ${ENTRA_CLIENT_SECRET:-}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:-}
+    ports:
+      # Genel giriş noktası artık proxy'dir. TLS'i kurumsal reverse proxy / LB
+      # sonlandırıyorsa bu portu ona bağla.
+      - "4180:4180"
+    restart: unless-stopped
+
+  # GÜVENLİK: Proxy devredeyken SSI'a doğrudan (proxy'siz) erişim kapatılmalıdır;
+  # aksi halde bir istemci X-Forwarded-* header'larını taklit edip RBAC'ı atlayabilir.
+  # Temel compose SSI'ı 5021'de yayınlar. Prod'da bu portu makine dışına AÇMAYIN:
+  # firewall ile kapatın ya da temel compose'da yayını "127.0.0.1:5021:5021" yapın.
+  # (Aşağıdaki override compose sürümüne göre birleşme davranışı değişebildiğinden
+  # port kaldırmayı ağ/firewall katmanında yapmak en güvenilir yoldur.)
+  ssi:
+    expose:
+      - "5021"

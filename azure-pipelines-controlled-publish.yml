@@ -1,0 +1,420 @@
+# Manual, fail-closed controlled publish worker.
+#
+# The SSI API evaluates policy and records approval. This isolated worker owns
+# the narrowly scoped Harbor write credential and publishes only an approved,
+# digest-pinned handoff. The default run is prepare-only and cannot mutate the
+# registry.
+trigger: none
+pr: none
+
+parameters:
+  - name: publishRequestId
+    displayName: Approved SSI publish request ID
+    type: string
+    default: PUB-0001
+  # The worker sends its handoff and receipt tokens to this address and publishes what
+  # the returned handoff names, so only the SSI addresses listed here can be chosen.
+  # Azure DevOps refuses a run that names any other value (UI and REST API alike). A new
+  # SSI address is a reviewed change to this list.
+  - name: ssiApiBaseUrl
+    displayName: SSI API base URL
+    type: string
+    default: http://10.0.0.10:5021/api/v1
+    values:
+      - http://10.0.0.10:5021/api/v1
+      - http://ssi.example.com/api/v1
+  - name: allowInsecurePocApi
+    displayName: Allow HTTP only for the current isolated PoC API
+    type: boolean
+    default: false
+  - name: harborCaCertPath
+    displayName: Trusted Harbor CA PEM path, or system
+    type: string
+    default: system
+  - name: executePublish
+    displayName: Execute approved registry publish
+    type: boolean
+    default: false
+
+pool: 'LinuxPool'
+
+# Values in this block are fixed: Azure DevOps does not let a run override a variable
+# defined in the YAML file, at queue time or through the REST API.
+variables:
+  REGCTL_IMAGE: docker.io/regclient/regctl@sha256:dbe356c6cf9f8f85e302b9e47fed481ef3f1b04807350e99b02ab2cadee0a993
+  # The approved catalog: the only place this worker may write. The handoff must name exactly
+  # this registry and project and a repository under this prefix, and its source must live on
+  # the same registry, or the run stops before any credential is used.
+  SSI_PUBLISH_TARGET_REGISTRY: registry.example.com
+  SSI_PUBLISH_TARGET_PROJECT: ssi-images
+  SSI_PUBLISH_TARGET_PREFIX: approved
+
+stages:
+  - stage: ControlledPublish
+    displayName: 'Policy-approved registry publish'
+    jobs:
+      - job: PublishApprovedDigest
+        displayName: 'Publish immutable digest with verification'
+        steps:
+          - checkout: none
+
+          - script: |
+              set -euo pipefail
+
+              RUN_DIR="$(Pipeline.Workspace)/ssi-controlled-publish"
+              HANDOFF_FILE="${RUN_DIR}/publish-handoff.json"
+              rm -rf "${RUN_DIR}"
+              mkdir -p "${RUN_DIR}"
+              chmod 700 "${RUN_DIR}"
+
+              if [[ ! "${PUBLISH_REQUEST_ID}" =~ ^PUB-[0-9]{4,}$ ]]; then
+                echo 'publishRequestId must use the PUB-0001 format.'
+                exit 2
+              fi
+              # Azure DevOps expands boolean parameters as True/False, so normalize the case
+              # before the fail-closed comparison. Only an explicit true opens the exception.
+              ALLOW_INSECURE_POC_API="$(printf '%s' "${ALLOW_INSECURE_POC_API}" | tr '[:upper:]' '[:lower:]')"
+              if [[ "${SSI_API_BASE_URL}" != https://* && "${ALLOW_INSECURE_POC_API}" != 'true' ]]; then
+                echo "Refusing to send a worker token over HTTP. Use HTTPS or explicitly enable the isolated PoC exception. (allowInsecurePocApi='${ALLOW_INSECURE_POC_API}')"
+                exit 2
+              fi
+              if [[ -z "${SSI_PUBLISH_HANDOFF_TOKEN}" || "${SSI_PUBLISH_HANDOFF_TOKEN}" == '$('* ]]; then
+                echo 'SSI_PUBLISH_HANDOFF_TOKEN secret variable is required.'
+                exit 2
+              fi
+
+              # curl --fail-with-body needs 7.76+, which the shared agent image does not carry.
+              # Capture the status explicitly instead: portable, and it keeps the error body
+              # for diagnostics. The SSI API never echoes the worker token in a response.
+              handoff_status="$(curl --silent --show-error \
+                --connect-timeout 5 --max-time 20 \
+                -H "X-SSI-Publish-Handoff-Token: ${SSI_PUBLISH_HANDOFF_TOKEN}" \
+                -o "${HANDOFF_FILE}" -w '%{http_code}' \
+                "${SSI_API_BASE_URL%/}/publish-requests/${PUBLISH_REQUEST_ID}/worker-handoff" || true)"
+              if [[ "${handoff_status}" != '200' ]]; then
+                echo "Publish handoff request failed with HTTP ${handoff_status:-000}."
+                head -c 2000 "${HANDOFF_FILE}" 2>/dev/null || true
+                echo
+                exit 2
+              fi
+
+              HANDOFF_FILE="${HANDOFF_FILE}" EXPECTED_REQUEST_ID="${PUBLISH_REQUEST_ID}" \
+                EXPECTED_TARGET_REGISTRY="${SSI_PUBLISH_TARGET_REGISTRY:-}" \
+                EXPECTED_TARGET_PROJECT="${SSI_PUBLISH_TARGET_PROJECT:-}" \
+                EXPECTED_TARGET_PREFIX="${SSI_PUBLISH_TARGET_PREFIX:-}" node <<'NODE'
+              const fs = require('fs');
+              const handoff = JSON.parse(fs.readFileSync(process.env.HANDOFF_FILE, 'utf8'));
+              const digest = /^sha256:[a-f0-9]{64}$/i;
+              const tag = /^[\w][\w.-]{0,127}$/;
+              const fail = (message) => { throw new Error(message); };
+
+              if (handoff.contractVersion !== 'ssi.publish-handoff/v1') fail('Unsupported publish handoff contract.');
+              if (handoff.requestId !== process.env.EXPECTED_REQUEST_ID) fail('Publish handoff request ID mismatch.');
+              if (handoff.policy?.decision !== 'Approved') fail('Publish handoff is not approved.');
+              if (!digest.test(handoff.source?.digest || '')) fail('Source digest is not immutable.');
+              if (!String(handoff.source?.immutableReference || '').endsWith(`@${handoff.source.digest}`)) {
+                fail('Source reference is not bound to the approved digest.');
+              }
+              if (!handoff.target?.registry || !handoff.target?.project || !handoff.target?.repository) {
+                fail('Publish target is incomplete.');
+              }
+              // Pinned boundary (variables block): the handoff cannot steer the write credential
+              // to another registry, project or folder, even if the handoff itself were forged.
+              const pinned = {
+                registry: process.env.EXPECTED_TARGET_REGISTRY || '',
+                project: process.env.EXPECTED_TARGET_PROJECT || '',
+                prefix: process.env.EXPECTED_TARGET_PREFIX || '',
+              };
+              if (!pinned.registry || !pinned.project || !pinned.prefix) fail('The pinned publish target is not configured in this pipeline.');
+              if (handoff.target.registry !== pinned.registry) fail(`Publish target registry must be ${pinned.registry}.`);
+              if (handoff.target.project !== pinned.project) fail(`Publish target project must be ${pinned.project}.`);
+              const component = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+              const segments = String(handoff.target.repository).split('/');
+              if (segments.length < 2 || segments[0] !== pinned.prefix || !segments.every((segment) => component.test(segment))) {
+                fail(`Publish target must be a repository under ${pinned.prefix}/.`);
+              }
+              if (!String(handoff.source.immutableReference).startsWith(`${pinned.registry}/`)) {
+                fail(`Publish source must be on ${pinned.registry}.`);
+              }
+              if (!tag.test(handoff.target?.tag || '') || handoff.target.tag.toLowerCase() === 'latest') {
+                fail('Publish target tag is mutable or invalid.');
+              }
+              const expectedTarget = `${handoff.target.registry}/${handoff.target.project}/${handoff.target.repository}:${handoff.target.tag}`;
+              if (handoff.target.tagReference !== expectedTarget) fail('Publish target reference is inconsistent.');
+              const expectedLatest = `${handoff.target.registry}/${handoff.target.project}/${handoff.target.repository}:latest`;
+              if (handoff.target.latestReference != null && handoff.target.latestReference !== expectedLatest) {
+                fail('Latest alias must stay in the approved target repository.');
+              }
+              if (handoff.constraints?.credentialMaterialIncluded !== false ||
+                  handoff.constraints?.overwriteExistingTag !== false ||
+                  handoff.constraints?.preserveManifestDigest !== true ||
+                  handoff.constraints?.verifyTargetDigest !== true) {
+                fail('Publish handoff constraints are not fail-closed.');
+              }
+              const serialized = JSON.stringify(handoff).toLowerCase();
+              if (serialized.includes('password') || serialized.includes('secret') || serialized.includes('token')) {
+                fail('Publish handoff contains credential-like material.');
+              }
+              NODE
+
+              echo 'Approved, credential-free publish handoff validated.'
+            displayName: 'Fetch and validate approved publish handoff'
+            env:
+              PUBLISH_REQUEST_ID: ${{ parameters.publishRequestId }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              ALLOW_INSECURE_POC_API: ${{ parameters.allowInsecurePocApi }}
+              SSI_PUBLISH_HANDOFF_TOKEN: $(SSI_PUBLISH_HANDOFF_TOKEN)
+              SSI_PUBLISH_TARGET_REGISTRY: $(SSI_PUBLISH_TARGET_REGISTRY)
+              SSI_PUBLISH_TARGET_PROJECT: $(SSI_PUBLISH_TARGET_PROJECT)
+              SSI_PUBLISH_TARGET_PREFIX: $(SSI_PUBLISH_TARGET_PREFIX)
+
+          - script: |
+              set -euo pipefail
+
+              RUN_DIR="$(Pipeline.Workspace)/ssi-controlled-publish"
+              HANDOFF_FILE="${RUN_DIR}/publish-handoff.json"
+              RECEIPT_FILE="${RUN_DIR}/publish-receipt.json"
+              CA_FILE="${RUN_DIR}/harbor-ca.pem"
+              DOCKER_CONFIG_DIR="${RUN_DIR}/docker"
+              REGCTL_CONFIG_DIR="${RUN_DIR}/regctl"
+
+              cleanup_sensitive() {
+                rm -rf "${DOCKER_CONFIG_DIR}" "${REGCTL_CONFIG_DIR}" "${CA_FILE}"
+              }
+              trap cleanup_sensitive EXIT
+
+              # Receipts are signed (docs/azure-devops-integration.md, "Worker sınırları"): HMAC-SHA256 over
+              # the channel purpose, a timestamp, the request ID, this worker's ID and the SHA-256 of the exact
+              # receipt bytes. SSI refuses a receipt that was altered, is older than its age limit, names
+              # another worker, or was signed for another request or channel. The secret stays in this process.
+              WORKER_ID="$(printf '%s:%s' "${AGENT_NAME:-unknown}" "${AGENT_MACHINENAME:-unknown}" | tr -c 'A-Za-z0-9._:-' '-' | cut -c1-128)"
+              [[ "${WORKER_ID}" =~ ^[A-Za-z0-9] ]] || WORKER_ID="w${WORKER_ID:0:127}"
+              # Prints the signature headers of a receipt file, one per line; fails when it cannot sign.
+              receipt_signature_headers() {
+                RECEIPT_FILE="$1" SUBJECT="${PUBLISH_REQUEST_ID}" WORKER_ID="${WORKER_ID}" node <<'NODE'
+              const { createHash, createHmac } = require('node:crypto');
+              const body = require('node:fs').readFileSync(process.env.RECEIPT_FILE);
+              const secret = process.env.SSI_PUBLISH_RECEIPT_HMAC_SECRET || '';
+              if (Buffer.byteLength(secret, 'utf8') < 32) {
+                console.error('SSI_PUBLISH_RECEIPT_HMAC_SECRET must contain at least 32 bytes.');
+                process.exit(1);
+              }
+              const timestamp = Math.floor(Date.now() / 1000);
+              const contentDigest = `sha256:${createHash('sha256').update(body).digest('hex')}`;
+              const payload = ['ssi-publish-receipt-v1', timestamp, process.env.SUBJECT, process.env.WORKER_ID, contentDigest].join('\n');
+              const signature = createHmac('sha256', secret).update(payload).digest('hex');
+              console.log('X-SSI-Evidence-Version: v1');
+              console.log(`X-SSI-Evidence-Timestamp: ${timestamp}`);
+              console.log(`X-SSI-Evidence-Content-SHA256: ${contentDigest}`);
+              console.log(`X-SSI-Evidence-Worker-ID: ${process.env.WORKER_ID}`);
+              console.log(`X-SSI-Evidence-Signature: sha256=${signature}`);
+              NODE
+              }
+              # Fills RECEIPT_CURL_HEADERS with the curl -H arguments that sign a receipt file.
+              sign_receipt() {
+                local headers
+                headers="$(receipt_signature_headers "$1")" || return 1
+                RECEIPT_CURL_HEADERS=()
+                while IFS= read -r header; do RECEIPT_CURL_HEADERS+=(-H "${header}"); done <<<"${headers}"
+              }
+
+              # Same normalization as the HTTP guard: a capitalized True must not silently
+              # downgrade an approved execution run into a prepare-only run.
+              EXECUTE_PUBLISH="$(printf '%s' "${EXECUTE_PUBLISH}" | tr '[:upper:]' '[:lower:]')"
+              if [[ "${EXECUTE_PUBLISH}" != 'true' ]]; then
+                echo 'Prepare-only run completed. No registry write was attempted.'
+                exit 0
+              fi
+
+              for value_name in PUBLISH_ROBOT_USERNAME PUBLISH_ROBOT_SECRET SSI_PUBLISH_RECEIPT_HMAC_SECRET; do
+                value="${!value_name:-}"
+                if [[ -z "${value}" || "${value}" == '$('* ]]; then
+                  echo "${value_name} secret variable is required for an execution run."
+                  exit 2
+                fi
+              done
+              if ! command -v docker >/dev/null 2>&1; then
+                echo 'Docker is required on the isolated publish worker.'
+                exit 2
+              fi
+
+              mapfile -t HANDOFF_VALUES < <(HANDOFF_FILE="${HANDOFF_FILE}" node <<'NODE'
+              const handoff = JSON.parse(require('fs').readFileSync(process.env.HANDOFF_FILE, 'utf8'));
+              console.log(handoff.source.immutableReference);
+              console.log(handoff.source.digest);
+              console.log(handoff.target.tagReference);
+              console.log(handoff.target.registry);
+              NODE
+              )
+              SOURCE_REFERENCE="${HANDOFF_VALUES[0]}"
+              SOURCE_DIGEST="${HANDOFF_VALUES[1]}"
+              TARGET_REFERENCE="${HANDOFF_VALUES[2]}"
+              TARGET_REGISTRY="${HANDOFF_VALUES[3]}"
+              # The write credential is only ever presented to the pinned registry.
+              if [[ -z "${SSI_PUBLISH_TARGET_REGISTRY:-}" || "${TARGET_REGISTRY}" != "${SSI_PUBLISH_TARGET_REGISTRY}" ]]; then
+                echo "Publish target registry is not the pinned ${SSI_PUBLISH_TARGET_REGISTRY:-registry}; no credential was used."
+                exit 2
+              fi
+
+              mkdir -p "${DOCKER_CONFIG_DIR}" "${REGCTL_CONFIG_DIR}"
+              chmod 700 "${DOCKER_CONFIG_DIR}" "${REGCTL_CONFIG_DIR}"
+              if [[ "${HARBOR_CA_CERT_PATH}" == 'system' ]]; then
+                for candidate in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+                  if [[ -r "${candidate}" ]]; then
+                    cp "${candidate}" "${CA_FILE}"
+                    break
+                  fi
+                done
+              elif [[ -r "${HARBOR_CA_CERT_PATH}" ]]; then
+                cp "${HARBOR_CA_CERT_PATH}" "${CA_FILE}"
+              else
+                echo 'Configured Harbor CA PEM path is not readable on this worker.'
+                exit 2
+              fi
+              if [[ ! -s "${CA_FILE}" ]]; then
+                echo 'No trusted CA bundle is available for the publish worker.'
+                exit 2
+              fi
+              chmod 600 "${CA_FILE}"
+
+              harbor_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+                --cacert "${CA_FILE}" -o /dev/null -w '%{http_code}' "https://${TARGET_REGISTRY}/v2/" || true)"
+              if [[ "${harbor_status}" != '200' && "${harbor_status}" != '401' && "${harbor_status}" != '403' ]]; then
+                echo "Registry TLS validation failed with HTTP ${harbor_status}."
+                exit 3
+              fi
+
+              regctl() {
+                docker run --interactive --rm \
+                  --network host \
+                  --user "$(id -u):$(id -g)" \
+                  -e REGCTL_CONFIG=/work/regctl/config.json \
+                  -e SSL_CERT_FILE=/work/harbor-ca.pem \
+                  -v "${RUN_DIR}:/work" \
+                  "${REGCTL_IMAGE}" "$@"
+              }
+
+              if ! printf '%s' "${PUBLISH_ROBOT_SECRET}" | regctl registry login \
+                "${TARGET_REGISTRY}" --user "${PUBLISH_ROBOT_USERNAME}" --pass-stdin; then
+                echo 'Dedicated publish robot could not authenticate to the approved registry.'
+                exit 3
+              fi
+              chmod 600 "${REGCTL_CONFIG_DIR}/config.json"
+
+              resolved_source="$(regctl image digest "${SOURCE_REFERENCE}")"
+              if [[ "${resolved_source}" != "${SOURCE_DIGEST}" ]]; then
+                echo 'Source digest no longer matches the approved immutable input.'
+                exit 4
+              fi
+
+              target_already_published='false'
+              set +e
+              existing_output="$(regctl image digest "${TARGET_REFERENCE}" 2>&1)"
+              existing_status=$?
+              set -e
+              if [[ ${existing_status} -eq 0 ]]; then
+                # A tag that already carries the approved manifest is not an overwrite: the copy
+                # is a no-op and the digest is byte-identical. Treating it as a resumed run keeps
+                # the worker retry-safe after an interrupted publish, while any other digest is
+                # still refused because that would be a real overwrite.
+                if [[ "${existing_output}" == "${SOURCE_DIGEST}" ]]; then
+                  echo 'Target tag already carries the approved manifest digest; resuming this publish without a registry write.'
+                  target_already_published='true'
+                else
+                  echo 'Target tag already exists with a different manifest. Controlled publish never overwrites an existing tag.'
+                  printf 'existing=%s approved=%s\n' "${existing_output}" "${SOURCE_DIGEST}"
+                  exit 4
+                fi
+              elif ! grep -Eiq 'not found|manifest unknown|404' <<<"${existing_output}"; then
+                echo 'Target availability could not be proven; refusing to treat the error as a missing tag.'
+                printf '%s\n' "${existing_output}"
+                exit 4
+              fi
+
+              if [[ "${target_already_published}" == 'true' ]]; then
+                echo 'Skipping the registry write; verifying the manifest already present at the target.'
+              else
+                echo 'Copying the approved immutable manifest to the controlled target.'
+                regctl image copy "${SOURCE_REFERENCE}" "${TARGET_REFERENCE}"
+              fi
+              target_digest="$(regctl image digest "${TARGET_REFERENCE}")"
+              if [[ "${target_digest}" != "${SOURCE_DIGEST}" ]]; then
+                echo 'Published target digest does not preserve the approved source manifest.'
+                exit 5
+              fi
+
+              # Only the approved publication advances latest; quarantine and Copa candidates
+              # never receive this alias. Copy by digest, even if another run changes a tag.
+              LATEST_REFERENCE="${TARGET_REFERENCE%:*}:latest"
+              regctl image copy "${TARGET_REFERENCE%:*}@${target_digest}" "${LATEST_REFERENCE}"
+              latest_digest="$(regctl image digest "${LATEST_REFERENCE}")"
+              if [[ "${latest_digest}" != "${SOURCE_DIGEST}" ]]; then
+                echo 'Latest alias digest does not match the approved publication.'
+                exit 5
+              fi
+
+              REQUEST_ID="${PUBLISH_REQUEST_ID}" \
+              SOURCE_DIGEST="${SOURCE_DIGEST}" \
+              TARGET_DIGEST="${target_digest}" \
+              TARGET_REFERENCE="${TARGET_REFERENCE}" \
+              LATEST_REFERENCE="${LATEST_REFERENCE}" \
+              LATEST_DIGEST="${latest_digest}" \
+              WORKER_ID="${WORKER_ID}" \
+              RECEIPT_FILE="${RECEIPT_FILE}" node <<'NODE'
+              const fs = require('fs');
+              fs.writeFileSync(process.env.RECEIPT_FILE, JSON.stringify({
+                contractVersion: 'ssi.publish-receipt/v1',
+                requestId: process.env.REQUEST_ID,
+                sourceDigest: process.env.SOURCE_DIGEST,
+                targetDigest: process.env.TARGET_DIGEST,
+                targetReference: process.env.TARGET_REFERENCE,
+                latestReference: process.env.LATEST_REFERENCE,
+                latestDigest: process.env.LATEST_DIGEST,
+                workerId: process.env.WORKER_ID,
+                publishedAt: new Date().toISOString(),
+                status: 'published',
+                verified: true,
+              }, null, 2));
+              NODE
+              if ! sign_receipt "${RECEIPT_FILE}"; then
+                echo 'The publish receipt could not be signed; the verified registry write is in the evidence artifact.'
+                exit 6
+              fi
+
+              # Same portable status handling as the handoff fetch. The registry write has
+              # already been verified at this point, so a failed receipt is reported with its
+              # body to allow a manual re-submission instead of an opaque curl exit code.
+              receipt_status="$(curl --silent --show-error \
+                --connect-timeout 5 --max-time 20 \
+                -H 'Content-Type: application/json' \
+                "${RECEIPT_CURL_HEADERS[@]}" \
+                --data-binary "@${RECEIPT_FILE}" \
+                -o "${RUN_DIR}/accepted-publish-request.json" -w '%{http_code}' \
+                "${SSI_API_BASE_URL%/}/publish-requests/${PUBLISH_REQUEST_ID}/receipt" || true)"
+              if [[ "${receipt_status}" != '200' ]]; then
+                echo "Publish receipt submission failed with HTTP ${receipt_status:-000} after a verified registry write."
+                head -c 2000 "${RUN_DIR}/accepted-publish-request.json" 2>/dev/null || true
+                echo
+                exit 6
+              fi
+
+              echo "Controlled publish verified: ${TARGET_REFERENCE}@${target_digest}"
+            displayName: 'Publish approved digest and submit receipt'
+            env:
+              EXECUTE_PUBLISH: ${{ parameters.executePublish }}
+              PUBLISH_REQUEST_ID: ${{ parameters.publishRequestId }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              HARBOR_CA_CERT_PATH: ${{ parameters.harborCaCertPath }}
+              REGCTL_IMAGE: $(REGCTL_IMAGE)
+              SSI_PUBLISH_TARGET_REGISTRY: $(SSI_PUBLISH_TARGET_REGISTRY)
+              PUBLISH_ROBOT_USERNAME: $(PUBLISH_ROBOT_USERNAME)
+              PUBLISH_ROBOT_SECRET: $(PUBLISH_ROBOT_SECRET)
+              SSI_PUBLISH_RECEIPT_HMAC_SECRET: $(SSI_PUBLISH_RECEIPT_HMAC_SECRET)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish controlled publish evidence'
+            condition: always()
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/ssi-controlled-publish'
+              ArtifactName: 'controlled-publish-evidence'
+              publishLocation: 'Container'

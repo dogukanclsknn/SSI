@@ -1,0 +1,36 @@
+# SSI HTTPS katmanı — nginx TLS reverse-proxy overlay.
+#
+# Temel compose'u DEĞİŞTİRMEZ; üstüne eklenir. Repo kökünden çalıştır:
+#
+#   docker compose -f docker-compose.yml \
+#     -f deploy/nginx/docker-compose.nginx.yml up -d --build
+#
+# (Yol'lar ilk -f dosyasının dizinine görecelidir; bu yüzden ./deploy/... ve ./certs kökten yazılır.)
+#
+# Aktive etmeden önce:
+#   1) Sertifika + key dosyalarını sunucuda ./certs/ altına koy:
+#        ./certs/ssi.fullchain.crt   (sunucu sertifikası + ara/CA zinciri)
+#        ./certs/ssi.key             (özel anahtar — chmod 600)
+#   2) .env'de: SSI_SESSION_COOKIE_SECURE=true  (artık HTTPS var)
+
+services:
+  nginx:
+    image: nginx:1.30-alpine
+    container_name: ssi-nginx
+    depends_on:
+      - ssi
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./deploy/nginx/ssi.conf:/etc/nginx/conf.d/default.conf:ro
+      # Sertifika dizini (varsayılan ./certs = /data/SSI/certs). SSI_TLS_CERT_DIR ile değiştirilebilir.
+      - ${SSI_TLS_CERT_DIR:-./certs}:/etc/nginx/certs:ro
+    restart: unless-stopped
+
+# GÜVENLİK (cutover): HTTPS devreye girince SSI'ın düz 5021 portuna DIŞARIDAN erişim
+# kapatılmalı — aksi halde kullanıcı proxy'yi (ve TLS'i) atlayabilir. Temel compose
+# 5021'i "5021:5021" ile yayınlıyor; cutover'da bunu "127.0.0.1:5021:5021" yap
+# (yalnızca sunucu-içi debug/curl açık kalır, dışarı kapanır) ya da firewall ile kapat.
+# nginx, ssi'ye compose ağından (servis adı `ssi`) eriştiği için bu değişiklik proxy'yi
+# etkilemez ve bu overlay ssi container'ını yeniden başlatmaz (expose override yok).

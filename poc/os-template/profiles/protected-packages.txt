@@ -1,0 +1,45 @@
+# Packages a template profile may never remove, not even as a side effect of another removal
+# (src/lib/templateProfile.js, guest/minimize.sh). One pattern per line; '*' is the only
+# wildcard. Every Essential or required-priority package is protected as well, without being
+# listed here. A change to this list is a reviewed commit.
+
+# Boot: kernel, boot loader, initramfs, Secure Boot
+linux-image-*
+linux-modules-*
+linux-generic*
+linux-virtual*
+linux-firmware
+grub-*
+shim-signed
+initramfs-tools*
+systemd
+systemd-sysv
+systemd-timesyncd
+udev
+dbus
+
+# Package management and trust
+apt
+dpkg
+ubuntu-keyring
+gpgv
+ca-certificates
+
+# Access and first boot: without these a VM made from the template cannot be reached
+openssh-server
+openssh-client
+sudo
+cloud-init
+cloud-guest-utils
+cloud-initramfs-growroot
+netplan.io
+iproute2
+isc-dhcp-client
+
+# Hypervisor guest agents (VMware, Proxmox/KVM)
+open-vm-tools
+qemu-guest-agent
+
+# Python runtime cloud-init and netplan need
+python3
+python3-minimal

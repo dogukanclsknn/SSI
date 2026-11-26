@@ -1,0 +1,38 @@
+{
+  "name": "ssi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "db:migrate": "node scripts/migrate.js",
+    "preview": "vite preview --host 0.0.0.0",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "test": "vitest run",
+    "test:e2e:tenancy": "node scripts/e2e/tenancy-e2e.mjs"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents": false
+  },
+  "dependencies": {
+    "ldapts": "^9.0.0",
+    "lucide-react": "^0.544.0",
+    "pg": "^8.22.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@vitejs/plugin-react": "^5.0.4",
+    "eslint": "^10.6.0",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.7.0",
+    "prettier": "^3.9.4",
+    "vite": "^7.1.7",
+    "vitest": "^4.1.9"
+  }
+}

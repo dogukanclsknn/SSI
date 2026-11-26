@@ -1,0 +1,301 @@
+# SSI pre-release candidate test worker.
+#
+# Runs the source image and the verified remediation output (the candidate) side by side
+# on the agent and checks that the candidate behaves like the source: same runtime
+# configuration, same startup with the default command, same health result, and an OS
+# package change report. The signed ssi.candidate-test/v1 result goes to SSI, where the
+# publish policy requires a passed test (and a consumer team's acceptance) before publish.
+#
+# Isolation: test containers run without any network, with CPU/memory/process limits and
+# no-new-privileges; nothing is privileged, no port is published and the Docker socket is
+# never mounted. Registry credentials live only in this run's temporary folder.
+trigger: none
+pr: none
+
+parameters:
+  - name: remediationJobId
+    displayName: Verified RM-EXEC job ID
+    type: string
+    default: ''
+  - name: sourceReference
+    displayName: Source image (harbor/project/repository@sha256:...)
+    type: string
+    default: ''
+  - name: candidateReference
+    displayName: Candidate image (harbor/project/repository@sha256:...)
+    type: string
+    default: ''
+  - name: harborCaCertPath
+    displayName: Trusted Harbor CA PEM path, or system
+    type: string
+    default: system
+  - name: deliverToSsi
+    displayName: Deliver the signed result to SSI
+    type: boolean
+    default: true
+
+pool: 'LinuxPool'
+
+variables:
+  HARBOR_HOST: registry.example.com
+  HARBOR_PROJECT: ssi-images
+  HARBOR_HOST_IP: 10.0.0.20
+  # Official Trivy v0.70.0 multi-platform manifest, pinned by digest (same as the Copa worker).
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+  STARTUP_OBSERVATION_SECONDS: '20'
+  HEALTH_TIMEOUT_SECONDS: '90'
+
+stages:
+  - stage: CandidateTest
+    displayName: 'Pre-release candidate test'
+    jobs:
+      - job: CompareSourceAndCandidate
+        displayName: 'Run source and candidate side by side'
+        timeoutInMinutes: 30
+        steps:
+          - checkout: self
+
+          - script: |
+              set -euo pipefail
+              umask 077
+
+              RUN_ID="ssi-candidate-${BUILD_BUILDID:?BUILD_BUILDID is required}"
+              WORK_DIR="${AGENT_TEMPDIRECTORY:?AGENT_TEMPDIRECTORY is required}/${RUN_ID}"
+              EVIDENCE_DIR="${BUILD_ARTIFACTSTAGINGDIRECTORY:?BUILD_ARTIFACTSTAGINGDIRECTORY is required}/candidate-test"
+              TOOL="${BUILD_SOURCESDIRECTORY:?BUILD_SOURCESDIRECTORY is required}/scripts/candidate-test.mjs"
+              JOB_ID="$(printf '%s' "${SSI_CANDIDATE_JOB_ID:-}" | tr -d '[:space:]')"
+              SOURCE_REFERENCE="$(printf '%s' "${SSI_CANDIDATE_SOURCE_REFERENCE:-}" | tr -d '[:space:]')"
+              CANDIDATE_REFERENCE="$(printf '%s' "${SSI_CANDIDATE_REFERENCE:-}" | tr -d '[:space:]')"
+              DELIVER_TO_SSI="$(printf '%s' "${SSI_CANDIDATE_DELIVER:-}" | tr '[:upper:]' '[:lower:]')"
+
+              # The reason is also written to the evidence folder, so the artifact step never
+              # fails with a second, misleading "Not found PathtoPublish" error.
+              fail() {
+                mkdir -p "${EVIDENCE_DIR}"
+                printf '%s\n' "$1" > "${EVIDENCE_DIR}/failure.txt"
+                echo "##vso[task.logissue type=error]$1"
+                exit 1
+              }
+              # A parameter value shown in a message: one line, at most 200 characters, no logging commands.
+              shown() { printf '%s' "$1" | head -c 200 | sed 's/##vso\[/##vso_[/g'; }
+
+              # --- Input validation (fail-closed, before any registry or Docker call) ---
+              [[ "${JOB_ID}" =~ ^RM-EXEC-[0-9]{4,}$ ]] || fail 'remediationJobId must identify a verified RM-EXEC job.'
+              reference_prefix="${HARBOR_HOST}/${HARBOR_PROJECT}/"
+              check_reference() {
+                local name="$1" reference="$2"
+                local hint="Copy it with the copy button in the Pre-release testing panel of ${JOB_ID} in SSI."
+                [[ -n "${reference}" ]] || fail "${name} is empty. ${hint}"
+                [[ "${reference}" == "${reference_prefix}"* ]] \
+                  || fail "${name} must start with ${reference_prefix} (received: $(shown "${reference}")). ${hint}"
+                [[ "${reference#"${reference_prefix}"}" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[a-f0-9]{64}$ ]] \
+                  || fail "${name} must be repository@sha256:<64 hex>, without a tag (received: $(shown "${reference}")). ${hint}"
+              }
+              check_reference sourceReference "${SOURCE_REFERENCE}"
+              check_reference candidateReference "${CANDIDATE_REFERENCE}"
+              [[ "${SOURCE_REFERENCE##*@}" != "${CANDIDATE_REFERENCE##*@}" ]] || fail 'The candidate digest must differ from the source digest.'
+              [[ "${DELIVER_TO_SSI}" == 'true' || "${DELIVER_TO_SSI}" == 'false' ]] || fail 'deliverToSsi must be true or false.'
+              [[ "${STARTUP_OBSERVATION_SECONDS}" =~ ^[0-9]{1,3}$ && "${HEALTH_TIMEOUT_SECONDS}" =~ ^[0-9]{1,3}$ ]] || fail 'Observation timeouts must be whole seconds.'
+              command -v docker >/dev/null 2>&1 || fail 'Docker CLI is not available on this agent.'
+              command -v node >/dev/null 2>&1 || fail 'Node.js is not available on this agent.'
+              [[ -r "${TOOL}" ]] || fail 'scripts/candidate-test.mjs is missing from the SSI checkout.'
+              if [[ -z "${HARBOR_ROBOT_USERNAME:-}" || "${HARBOR_ROBOT_USERNAME}" == \$\(* \
+                 || -z "${HARBOR_ROBOT_SECRET:-}" || "${HARBOR_ROBOT_SECRET}" == \$\(* ]]; then
+                fail 'Pipeline variables HARBOR_ROBOT_USERNAME and HARBOR_ROBOT_SECRET (secret, pull-only robot) are required.'
+              fi
+
+              SOURCE_CONTAINER="${RUN_ID}-source"
+              CANDIDATE_CONTAINER="${RUN_ID}-candidate"
+              cleanup() {
+                docker rm -f "${SOURCE_CONTAINER}" "${CANDIDATE_CONTAINER}" >/dev/null 2>&1 || true
+                docker rmi "${SOURCE_REFERENCE}" "${CANDIDATE_REFERENCE}" >/dev/null 2>&1 || true
+                docker --config "${WORK_DIR}/docker" logout "${HARBOR_HOST}" >/dev/null 2>&1 || true
+                rm -rf "${WORK_DIR}"
+              }
+              trap cleanup EXIT
+
+              mkdir -p "${WORK_DIR}/docker" "${WORK_DIR}/certs" "${WORK_DIR}/cache" "${EVIDENCE_DIR}"
+              chmod 700 "${WORK_DIR}" "${WORK_DIR}/docker"
+              export DOCKER_CONFIG="${WORK_DIR}/docker"
+
+              # Harbor CA for the Trivy container (same trust model as the Copa worker).
+              CA_FILE="${WORK_DIR}/certs/harbor-ca.pem"
+              if [[ "${SSI_CANDIDATE_HARBOR_CA_CERT_PATH:-system}" == 'system' ]]; then
+                for candidate in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+                  if [[ -r "${candidate}" ]]; then cp "${candidate}" "${CA_FILE}"; break; fi
+                done
+              elif [[ -r "${SSI_CANDIDATE_HARBOR_CA_CERT_PATH}" ]]; then
+                cp "${SSI_CANDIDATE_HARBOR_CA_CERT_PATH}" "${CA_FILE}"
+              fi
+              [[ -s "${CA_FILE}" ]] || fail 'No readable CA bundle for Harbor TLS.'
+              chmod 644 "${CA_FILE}"
+
+              echo "Job ${JOB_ID}"
+              echo "Source:    ${SOURCE_REFERENCE}"
+              echo "Candidate: ${CANDIDATE_REFERENCE}"
+              printf '%s' "${HARBOR_ROBOT_SECRET}" | docker login "${HARBOR_HOST}" --username "${HARBOR_ROBOT_USERNAME}" --password-stdin >/dev/null \
+                || fail 'Harbor login failed. Check the robot account variables.'
+
+              docker pull --quiet "${SOURCE_REFERENCE}" >/dev/null
+              docker pull --quiet "${CANDIDATE_REFERENCE}" >/dev/null
+              docker image inspect "${SOURCE_REFERENCE}" > "${WORK_DIR}/source-image.json"
+              docker image inspect "${CANDIDATE_REFERENCE}" > "${WORK_DIR}/candidate-image.json"
+
+              # Start both images with their own default command, isolated and resource-limited.
+              # Only an image without a default command ("no command specified") is recorded as
+              # not-started, which the analysis compares with the source. Any other start error
+              # (disk, daemon, cgroup, registry) is an infrastructure failure and stops the run,
+              # so it can never turn into a passed test.
+              start_container() {
+                local name="$1" reference="$2" output="$3" reason
+                if ! docker run --detach --name "${name}" \
+                  --network none \
+                  --memory 512m --memory-swap 512m --cpus 1 --pids-limit 256 \
+                  --security-opt no-new-privileges:true \
+                  --label "ssi.candidate-test=${RUN_ID}" \
+                  "${reference}" >/dev/null 2>"${WORK_DIR}/${name}-start.err"; then
+                  # Image-controlled text: one line, no logging commands.
+                  reason="$(head -c 300 "${WORK_DIR}/${name}-start.err" | tr -d '\r\n' | sed 's/##vso\[/##vso_[/g')"
+                  if ! grep -q 'no command specified' "${WORK_DIR}/${name}-start.err"; then
+                    fail "Container ${name} could not be started for an infrastructure reason: ${reason}"
+                  fi
+                  echo "Container ${name} has no default command: ${reason}"
+                  printf '[{"State":{"Status":"not-started","Running":false,"ExitCode":null}}]\n' > "${output}"
+                  return 1
+                fi
+              }
+              source_started=true
+              candidate_started=true
+              start_container "${SOURCE_CONTAINER}" "${SOURCE_REFERENCE}" "${WORK_DIR}/source-container.json" || source_started=false
+              start_container "${CANDIDATE_CONTAINER}" "${CANDIDATE_REFERENCE}" "${WORK_DIR}/candidate-container.json" || candidate_started=false
+
+              healthcheck_of() {
+                docker image inspect --format '{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}{{end}}' "$1"
+              }
+              health_of() {
+                docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$1" 2>/dev/null || echo none
+              }
+              wants_health=false
+              if [[ -n "$(healthcheck_of "${SOURCE_REFERENCE}")" || -n "$(healthcheck_of "${CANDIDATE_REFERENCE}")" ]]; then
+                wants_health=true
+              fi
+              sleep "${STARTUP_OBSERVATION_SECONDS}"
+              if [[ "${wants_health}" == 'true' ]]; then
+                waited="${STARTUP_OBSERVATION_SECONDS}"
+                while (( waited < HEALTH_TIMEOUT_SECONDS )); do
+                  source_health="$(health_of "${SOURCE_CONTAINER}")"
+                  candidate_health="$(health_of "${CANDIDATE_CONTAINER}")"
+                  [[ "${source_health}" != 'starting' && "${candidate_health}" != 'starting' ]] && break
+                  sleep 2
+                  waited=$(( waited + 2 ))
+                done
+              fi
+
+              if [[ "${source_started}" == 'true' ]]; then
+                docker inspect "${SOURCE_CONTAINER}" > "${WORK_DIR}/source-container.json"
+                docker logs --tail 100 "${SOURCE_CONTAINER}" > "${EVIDENCE_DIR}/source-container.log" 2>&1 || true
+              fi
+              if [[ "${candidate_started}" == 'true' ]]; then
+                docker inspect "${CANDIDATE_CONTAINER}" > "${WORK_DIR}/candidate-container.json"
+                docker logs --tail 100 "${CANDIDATE_CONTAINER}" > "${EVIDENCE_DIR}/candidate-container.log" 2>&1 || true
+              fi
+              docker rm -f "${SOURCE_CONTAINER}" "${CANDIDATE_CONTAINER}" >/dev/null 2>&1 || true
+
+              # OS package inventory of both images (Trivy license scanner: lists packages
+              # without downloading the vulnerability database).
+              trivy_packages() {
+                docker run --rm \
+                  --network host \
+                  --add-host "${HARBOR_HOST}:${HARBOR_HOST_IP}" \
+                  --user "$(id -u):$(id -g)" \
+                  -e DOCKER_CONFIG=/work/docker \
+                  -e TRIVY_CACHE_DIR=/work/cache \
+                  -e SSL_CERT_FILE=/work/certs/harbor-ca.pem \
+                  -v "${WORK_DIR}:/work" \
+                  "${TRIVY_IMAGE}" image \
+                  --image-src remote \
+                  --scanners license \
+                  --pkg-types os \
+                  --format json \
+                  --output "/work/$2" \
+                  --quiet \
+                  --timeout 10m \
+                  "$1"
+              }
+              trivy_packages "${SOURCE_REFERENCE}" source-trivy.json
+              trivy_packages "${CANDIDATE_REFERENCE}" candidate-trivy.json
+
+              RESULT="$(node "${TOOL}" assemble \
+                --job-id "${JOB_ID}" \
+                --source-ref "${SOURCE_REFERENCE}" \
+                --candidate-ref "${CANDIDATE_REFERENCE}" \
+                --source-image "${WORK_DIR}/source-image.json" \
+                --candidate-image "${WORK_DIR}/candidate-image.json" \
+                --source-container "${WORK_DIR}/source-container.json" \
+                --candidate-container "${WORK_DIR}/candidate-container.json" \
+                --source-trivy "${WORK_DIR}/source-trivy.json" \
+                --candidate-trivy "${WORK_DIR}/candidate-trivy.json" \
+                --pipeline "${BUILD_DEFINITIONNAME:-SSI - Candidate Test}" \
+                --build-id "${BUILD_BUILDID}" \
+                --agent "${AGENT_NAME:-unknown}" \
+                --out "${EVIDENCE_DIR}/candidate-test-result.json")"
+              node "${TOOL}" summary --file "${EVIDENCE_DIR}/candidate-test-result.json" --out "${EVIDENCE_DIR}/summary.md"
+              echo "##vso[task.uploadsummary]${EVIDENCE_DIR}/summary.md"
+              echo "Candidate test result: ${RESULT}"
+
+              # A failed test is delivered too: SSI must know the candidate failed.
+              if [[ "${DELIVER_TO_SSI}" == 'true' ]] && {
+                [[ -z "${SSI_CANDIDATE_TEST_EVIDENCE_HMAC_SECRET:-}" || "${SSI_CANDIDATE_TEST_EVIDENCE_HMAC_SECRET}" == \$\(* ]] \
+                  || [[ -z "${SSI_API_BASE_URL:-}" || "${SSI_API_BASE_URL}" == \$\(* ]]
+              }; then
+                echo '##vso[task.logissue type=warning]SSI_API_BASE_URL or the secret SSI_CANDIDATE_TEST_EVIDENCE_HMAC_SECRET is not set; upload candidate-test-result.json from the artifact on the RM-EXEC page.'
+                echo '##vso[task.complete result=SucceededWithIssues;]'
+              elif [[ "${DELIVER_TO_SSI}" == 'true' ]]; then
+                set +e
+                node "${TOOL}" deliver \
+                  --file "${EVIDENCE_DIR}/candidate-test-result.json" \
+                  --job-id "${JOB_ID}" \
+                  --api-base-url "${SSI_API_BASE_URL:-}" \
+                  --allow-http "${SSI_API_ALLOW_HTTP:-false}" \
+                  --worker-id "${AGENT_NAME:-agent}:${AGENT_MACHINENAME:-unknown}"
+                delivery_status=$?
+                set -e
+                if [[ "${delivery_status}" -eq 2 ]]; then
+                  echo '##vso[task.logissue type=warning]SSI was unreachable; upload candidate-test-result.json from the artifact on the RM-EXEC page.'
+                  echo '##vso[task.complete result=SucceededWithIssues;]'
+                elif [[ "${delivery_status}" -ne 0 ]]; then
+                  fail 'SSI rejected the candidate test result (see the message above).'
+                fi
+              else
+                echo '##vso[task.logissue type=warning]Delivery to SSI is off; upload candidate-test-result.json on the RM-EXEC page.'
+              fi
+
+              [[ "${RESULT}" == 'passed' ]] || fail 'The candidate does not behave like the source. See the summary for the failing checks.'
+            displayName: 'Test candidate against source'
+            env:
+              SSI_CANDIDATE_JOB_ID: ${{ parameters.remediationJobId }}
+              SSI_CANDIDATE_SOURCE_REFERENCE: ${{ parameters.sourceReference }}
+              SSI_CANDIDATE_REFERENCE: ${{ parameters.candidateReference }}
+              SSI_CANDIDATE_HARBOR_CA_CERT_PATH: ${{ parameters.harborCaCertPath }}
+              SSI_CANDIDATE_DELIVER: ${{ parameters.deliverToSsi }}
+              HARBOR_ROBOT_USERNAME: $(HARBOR_ROBOT_USERNAME)
+              HARBOR_ROBOT_SECRET: $(HARBOR_ROBOT_SECRET)
+              SSI_API_BASE_URL: $(SSI_API_BASE_URL)
+              SSI_API_ALLOW_HTTP: $(SSI_API_ALLOW_HTTP)
+              SSI_CANDIDATE_TEST_EVIDENCE_HMAC_SECRET: $(SSI_CANDIDATE_TEST_EVIDENCE_HMAC_SECRET)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish candidate test evidence'
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/candidate-test'
+              ArtifactName: 'candidate-test-evidence'
+              publishLocation: 'Container'
+
+          - script: |
+              RUN_ID="ssi-candidate-${BUILD_BUILDID:?BUILD_BUILDID is required}"
+              docker ps --all --quiet --filter "label=ssi.candidate-test=${RUN_ID}" | xargs --no-run-if-empty docker rm -f >/dev/null 2>&1 || true
+              rm -rf "${AGENT_TEMPDIRECTORY:?AGENT_TEMPDIRECTORY is required}/${RUN_ID}"
+              echo "Cleanup done: only this run's containers and temporary files were removed."
+            displayName: 'Cleanup (only this run)'
+            condition: always()

@@ -1,0 +1,251 @@
+# Manual-only remediation worker preflight.
+# This pipeline never patches, pushes, publishes, or mutates a Harbor artifact.
+# It verifies the technical prerequisites that a separate, least-privilege Copa worker
+# will need before an execution pipeline can be approved.
+trigger: none
+pr: none
+
+parameters:
+  - name: sourceRepository
+    displayName: Harbor source repository
+    type: string
+    default: ssi-remediation-test
+  - name: sourceDigest
+    displayName: Immutable source digest (sha256:...)
+    type: string
+    default: ''
+  - name: canonicalReceiptContentDigest
+    displayName: SSI canonical receipt content digest (sha256:...)
+    type: string
+    default: ''
+  - name: outputTag
+    displayName: Proposed output tag (not created by this pipeline)
+    type: string
+    default: copa-r1
+  - name: copaExecutable
+    displayName: Pre-provisioned Copa executable or path
+    type: string
+    default: copa
+  - name: harborCaCertPath
+    displayName: Trusted Harbor CA PEM path, or system
+    type: string
+    # Azure DevOps renders string parameters as required. "system" explicitly
+    # selects the agent trust store without pretending a PEM file exists.
+    default: system
+
+pool: 'LinuxPool'
+
+variables:
+  HARBOR_HOST: registry.example.com
+  HARBOR_PROJECT: ssi-images
+  # Pin the expected tool version. The worker image or agent baseline supplies the binary;
+  # this preflight intentionally does not download an unverified executable at runtime.
+  COPA_EXPECTED_VERSION: '0.14.2'
+
+stages:
+  - stage: WorkerPreflight
+    displayName: 'Validate isolated remediation worker prerequisites'
+    jobs:
+      - job: ValidateWorker
+        displayName: 'Read-only worker preflight'
+        steps:
+          - script: |
+              set -euo pipefail
+
+              SOURCE_REPOSITORY="${SSI_PREFLIGHT_SOURCE_REPOSITORY:?SSI_PREFLIGHT_SOURCE_REPOSITORY is required}"
+              SOURCE_DIGEST="${SSI_PREFLIGHT_SOURCE_DIGEST:?SSI_PREFLIGHT_SOURCE_DIGEST is required}"
+              CANONICAL_RECEIPT_CONTENT_DIGEST="${SSI_PREFLIGHT_CANONICAL_RECEIPT_CONTENT_DIGEST:?SSI_PREFLIGHT_CANONICAL_RECEIPT_CONTENT_DIGEST is required}"
+              OUTPUT_TAG="${SSI_PREFLIGHT_OUTPUT_TAG:?SSI_PREFLIGHT_OUTPUT_TAG is required}"
+              COPA_BIN="${SSI_PREFLIGHT_COPA_EXECUTABLE:?SSI_PREFLIGHT_COPA_EXECUTABLE is required}"
+              HARBOR_CA_CERT_PATH="${SSI_PREFLIGHT_HARBOR_CA_CERT_PATH:?SSI_PREFLIGHT_HARBOR_CA_CERT_PATH is required}"
+              if [[ "${HARBOR_CA_CERT_PATH}" == 'system' ]]; then
+                HARBOR_CA_CERT_PATH=''
+              fi
+              RUN_DIR="$(Pipeline.Workspace)/remediation-worker-preflight"
+
+              if [[ ! "${SOURCE_REPOSITORY}" =~ ^[a-z0-9][a-z0-9._/-]*$ ]]; then
+                echo 'sourceRepository must be a lower-case Harbor repository path.'
+                exit 2
+              fi
+
+              if [[ ! "${SOURCE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'sourceDigest must be a complete immutable sha256 digest. Tags are intentionally rejected.'
+                exit 2
+              fi
+
+              if [[ ! "${CANONICAL_RECEIPT_CONTENT_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'canonicalReceiptContentDigest must be the canonical receipt value accepted by SSI for the validated Trivy JSON artifact.'
+                exit 2
+              fi
+
+              if [[ ! "${OUTPUT_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+                echo 'outputTag is not a valid container image tag.'
+                exit 2
+              fi
+
+              mkdir -p "${RUN_DIR}"
+              docker_available=false
+              buildx_available=false
+              buildkit_inspectable=false
+              copa_available=false
+              copa_version_matches=false
+              harbor_ca_trusted=false
+              robot_credentials_configured=false
+              docker_version=''
+              buildx_version=''
+              copa_version=''
+              harbor_status='000'
+              harbor_ca_mode='system'
+
+              echo "Agent: ${AGENT_NAME:-unknown} on ${AGENT_MACHINENAME:-unknown}"
+              echo "Preflight source: ${HARBOR_HOST}/${HARBOR_PROJECT}/${SOURCE_REPOSITORY}@${SOURCE_DIGEST}"
+              echo "Proposed output: ${HARBOR_HOST}/${HARBOR_PROJECT}/${SOURCE_REPOSITORY}:${OUTPUT_TAG}"
+              echo 'Execution mode: preflight only. No Copa patch, image push, publish, or re-scan will run.'
+
+              if command -v docker >/dev/null 2>&1; then
+                docker_available=true
+                docker_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+              fi
+
+              if [[ "${docker_available}" == 'true' ]] && docker buildx version >/dev/null 2>&1; then
+                buildx_available=true
+                buildx_version="$(docker buildx version 2>/dev/null || true)"
+                if docker buildx inspect >/dev/null 2>&1; then
+                  buildkit_inspectable=true
+                fi
+              fi
+
+              if command -v "${COPA_BIN}" >/dev/null 2>&1; then
+                copa_available=true
+                copa_version="$("${COPA_BIN}" version 2>/dev/null || true)"
+                if [[ "${copa_version}" == *"${COPA_EXPECTED_VERSION}"* ]]; then
+                  copa_version_matches=true
+                fi
+              fi
+
+              if [[ -n "${HARBOR_CA_CERT_PATH}" ]]; then
+                harbor_ca_mode='provided-pem'
+                if [[ -f "${HARBOR_CA_CERT_PATH}" ]]; then
+                  harbor_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 --cacert "${HARBOR_CA_CERT_PATH}" -o /dev/null -w '%{http_code}' "https://${HARBOR_HOST}/v2/" || true)"
+                else
+                  echo 'Configured Harbor CA path does not exist on this agent.'
+                fi
+              else
+                harbor_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 -o /dev/null -w '%{http_code}' "https://${HARBOR_HOST}/v2/" || true)"
+              fi
+
+              if [[ "${harbor_status}" == '200' || "${harbor_status}" == '401' || "${harbor_status}" == '403' ]]; then
+                harbor_ca_trusted=true
+              fi
+
+              is_unresolved_azure_macro() {
+                [[ "$1" =~ ^\$\([A-Za-z0-9_.-]+\)$ ]]
+              }
+
+              if [[ -n "${SSI_PREFLIGHT_ROBOT_USERNAME:-}" && -n "${SSI_PREFLIGHT_ROBOT_SECRET:-}" ]] &&
+                    ! is_unresolved_azure_macro "${SSI_PREFLIGHT_ROBOT_USERNAME}" &&
+                    ! is_unresolved_azure_macro "${SSI_PREFLIGHT_ROBOT_SECRET}"; then
+                robot_credentials_configured=true
+              fi
+              echo "Robot credential inputs mapped: ${robot_credentials_configured}"
+
+              export PREFLIGHT_SOURCE_REPOSITORY="${SOURCE_REPOSITORY}"
+              export PREFLIGHT_SOURCE_DIGEST="${SOURCE_DIGEST}"
+              export PREFLIGHT_RECEIPT_CONTENT_DIGEST="${CANONICAL_RECEIPT_CONTENT_DIGEST}"
+              export PREFLIGHT_OUTPUT_REFERENCE="${HARBOR_HOST}/${HARBOR_PROJECT}/${SOURCE_REPOSITORY}:${OUTPUT_TAG}"
+              export PREFLIGHT_AGENT_NAME="${AGENT_NAME:-unknown}"
+              export PREFLIGHT_AGENT_MACHINE="${AGENT_MACHINENAME:-unknown}"
+              export PREFLIGHT_DOCKER_AVAILABLE="${docker_available}"
+              export PREFLIGHT_DOCKER_VERSION="${docker_version}"
+              export PREFLIGHT_BUILDX_AVAILABLE="${buildx_available}"
+              export PREFLIGHT_BUILDX_VERSION="${buildx_version}"
+              export PREFLIGHT_BUILDKIT_INSPECTABLE="${buildkit_inspectable}"
+              export PREFLIGHT_COPA_AVAILABLE="${copa_available}"
+              export PREFLIGHT_COPA_VERSION="${copa_version}"
+              export PREFLIGHT_COPA_VERSION_MATCHES="${copa_version_matches}"
+              export PREFLIGHT_HARBOR_CA_TRUSTED="${harbor_ca_trusted}"
+              export PREFLIGHT_HARBOR_CA_MODE="${harbor_ca_mode}"
+              export PREFLIGHT_HARBOR_STATUS="${harbor_status}"
+              export PREFLIGHT_ROBOT_CREDENTIALS_CONFIGURED="${robot_credentials_configured}"
+
+              node - "${RUN_DIR}/worker-preflight.json" <<'NODE'
+              const fs = require('node:fs');
+              const path = process.argv[2];
+              const bool = (name) => process.env[name] === 'true';
+              const checks = [
+                { id: 'docker-runtime', met: bool('PREFLIGHT_DOCKER_AVAILABLE'), detail: process.env.PREFLIGHT_DOCKER_VERSION || 'Docker CLI/runtime not available.' },
+                { id: 'buildx', met: bool('PREFLIGHT_BUILDX_AVAILABLE'), detail: process.env.PREFLIGHT_BUILDX_VERSION || 'docker buildx is not available.' },
+                { id: 'buildkit-inspection', met: bool('PREFLIGHT_BUILDKIT_INSPECTABLE'), detail: 'Read-only docker buildx inspect check; no builder was created or modified.' },
+                { id: 'copa', met: bool('PREFLIGHT_COPA_AVAILABLE'), detail: process.env.PREFLIGHT_COPA_VERSION || 'Pre-provisioned Copa executable not found.' },
+                { id: 'copa-version', met: bool('PREFLIGHT_COPA_VERSION_MATCHES'), detail: 'Expected Copa version: 0.14.2.' },
+                { id: 'harbor-ca-trust', met: bool('PREFLIGHT_HARBOR_CA_TRUSTED'), detail: `HTTPS /v2/ returned ${process.env.PREFLIGHT_HARBOR_STATUS || '000'} using ${process.env.PREFLIGHT_HARBOR_CA_MODE} trust.` },
+                { id: 'registry-credentials-configured', met: bool('PREFLIGHT_ROBOT_CREDENTIALS_CONFIGURED'), detail: 'Credential presence only; no credential value is recorded.' },
+                { id: 'immutable-source-digest', met: true, detail: process.env.PREFLIGHT_SOURCE_DIGEST },
+                { id: 'canonical-receipt-content-digest', met: true, detail: process.env.PREFLIGHT_RECEIPT_CONTENT_DIGEST },
+              ];
+              const technicalReady = checks.every((check) => check.met);
+              const result = {
+                contractVersion: 'ssi.remediation-worker-preflight/v1alpha1',
+                kind: 'RemediationWorkerPreflight',
+                generatedAt: new Date().toISOString(),
+                execution: {
+                  mode: 'preflight-only',
+                  patchAttempted: false,
+                  registryWriteAttempted: false,
+                  publishAttempted: false,
+                  verificationScanAttempted: false,
+                },
+                source: {
+                  repository: process.env.PREFLIGHT_SOURCE_REPOSITORY,
+                  digest: process.env.PREFLIGHT_SOURCE_DIGEST,
+                },
+                canonicalInput: {
+                  contentDigest: process.env.PREFLIGHT_RECEIPT_CONTENT_DIGEST,
+                  rawReportEmbedded: false,
+                },
+                proposedOutputReference: process.env.PREFLIGHT_OUTPUT_REFERENCE,
+                agent: {
+                  name: process.env.PREFLIGHT_AGENT_NAME,
+                  machine: process.env.PREFLIGHT_AGENT_MACHINE,
+                },
+                checks,
+                result: {
+                  technicalReady,
+                  executionAuthorized: false,
+                  status: technicalReady ? 'ready-for-isolated-worker' : 'blocked',
+                  nextGate: technicalReady
+                    ? 'Dedicated remediation worker, protected environment approval, and target repository policy are still required.'
+                    : 'Resolve unmet technical checks before an execution worker is considered.',
+                },
+              };
+              fs.writeFileSync(path, `${JSON.stringify(result, null, 2)}\n`);
+              console.log(`Worker preflight completed: ${result.result.status}.`);
+              console.log(`Technical checks passed: ${checks.filter((check) => check.met).length}/${checks.length}.`);
+              NODE
+
+              cat "${RUN_DIR}/worker-preflight.json"
+            displayName: 'Validate technical remediation worker prerequisites'
+            env:
+              # Do not use the reserved INPUT_* prefix here. CommandLine@2 uses it
+              # internally for task inputs and can omit colliding custom variables.
+              SSI_PREFLIGHT_SOURCE_REPOSITORY: ${{ parameters.sourceRepository }}
+              SSI_PREFLIGHT_SOURCE_DIGEST: ${{ parameters.sourceDigest }}
+              SSI_PREFLIGHT_CANONICAL_RECEIPT_CONTENT_DIGEST: ${{ parameters.canonicalReceiptContentDigest }}
+              SSI_PREFLIGHT_OUTPUT_TAG: ${{ parameters.outputTag }}
+              SSI_PREFLIGHT_COPA_EXECUTABLE: ${{ parameters.copaExecutable }}
+              SSI_PREFLIGHT_HARBOR_CA_CERT_PATH: ${{ parameters.harborCaCertPath }}
+              # Map pipeline variables to distinct task-scoped names. This avoids
+              # self-referential macro expansion and never prints either value.
+              SSI_PREFLIGHT_ROBOT_USERNAME: $(HARBOR_ROBOT_USERNAME)
+              SSI_PREFLIGHT_ROBOT_SECRET: $(HARBOR_ROBOT_SECRET)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish remediation worker preflight'
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/remediation-worker-preflight/worker-preflight.json'
+              ArtifactName: 'remediation-worker-preflight'
+              publishLocation: 'Container'
+
+          - script: rm -rf "$(Pipeline.Workspace)/remediation-worker-preflight"
+            displayName: 'Remove transient preflight files'
+            condition: always()

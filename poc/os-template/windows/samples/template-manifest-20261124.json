@@ -1,0 +1,55 @@
+{
+    "manifestVersion":  "ssi.os-template-manifest/v1",
+    "template":  {
+                     "name":  "ssi-ws2025-std-de",
+                     "version":  "26100.33822",
+                     "os":  "windows-server-2025",
+                     "edition":  "Windows Server 2025 Standard Evaluation (Desktop Experience)",
+                     "architecture":  "amd64"
+                 },
+    "build":  {
+                  "id":  "20261124-095815",
+                  "createdAt":  "2026-11-24T10:33:09Z",
+                  "tools":  {
+                                "dism":  "10.0.26100.9457",
+                                "oscdimg":  "2.56.0.1010",
+                                "powershell":  "5.1.20348.5773"
+                            }
+              },
+    "base":  {
+                 "file":  "WS2025_EVAL_en-us.iso",
+                 "sha256":  "7b052573ba7894c9924e3e87ba732ccd354d18cb75a883efa9b900ea125bfd51",
+                 "imageIndex":  2,
+                 "build":  "10.0.26100.32230"
+             },
+    "updates":  [
+                    {
+                        "kb":  "KB5043080",
+                        "file":  "windows11.0-kb5043080-x64_953449672073f8fb99badb4cc6d5d7849b9c83e8.msu",
+                        "sha256":  "819632610a101af11c72907fb13ff05b5fb4222c0e263ee9a03bcc1d1d5f26a4",
+                        "applied":  false
+                    },
+                    {
+                        "kb":  "KB5131080",
+                        "file":  "windows11.0-kb5131080-x64_3a6d5dabe658c5cef242dc6d8f0cefdfd8504e36.msu",
+                        "sha256":  "fab371b2ecfafea28af9608c077bafba3c5e9768e0ef30e56073819dca1968ef",
+                        "applied":  true
+                    }
+                ],
+    "scan":  {
+                 "source":  "Microsoft Security Update Guide (MSRC CVRF API v3.0)",
+                 "before":  { "build":  "10.0.26100.32230", "open":  3388, "critical":  210, "important":  3173 },
+                 "after":  { "build":  "10.0.26100.33822", "open":  0, "critical":  0, "important":  0 },
+                 "gate":  { "maxOpenAfter":  0, "passed":  true }
+             },
+    "artifacts":  [
+                      {
+                          "file":  "ssi-ws2025-std-de-26100.33822.iso",
+                          "format":  "iso",
+                          "sizeBytes":  8092522496,
+                          "sha256":  "45594952f01aed6fe7b85368f49787e6243b0b62bc4d23771d6787cbecd43606",
+                          "signature":  null
+                      }
+                  ],
+    "signing":  { "signed":  false }
+}

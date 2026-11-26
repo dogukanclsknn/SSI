@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.DS_Store
+npm-debug.log*
+Dockerfile
+docker-compose.yml
+# Server secrets never enter the build context (the image reads them from the environment).
+.env
+.env.*
+!.env.example
+# Proof-of-concept tooling (OS templates) never belongs in the SSI image.
+poc/

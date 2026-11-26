@@ -1,0 +1,364 @@
+# Manual supply-chain signing worker (Tema F).
+# approved/ digest'ini AÇIK KAYNAK araçlarla imzalar + SBOM + provenance ekler ve
+# doğrulanmış bir kanıt receipt'ini SSI'ya gönderir. Ticari araç/lisans YOK:
+#   - Anchore Syft  → CycloneDX SBOM
+#   - Sigstore Cosign → imza + attestation (key-based, iç Harbor için Rekor kapalı)
+#
+# Bu worker SSI deploy etmez, imaj yamalamaz, remediation yapmaz. Yalnızca zaten yayınlanmış
+# (approved/) immutable bir digest'i imzalar. Cosign private key + parola yalnızca pipeline
+# SECRET'larından gelir; log'a yazılmaz, artifact'a konmaz. İlk gerçek çalıştırmada
+# cosign/syft sürüm çıktıları bir kez doğrulanmalıdır.
+trigger: none
+pr: none
+
+parameters:
+  # Must be a repository under approved/: only images the controlled publish worker has
+  # written to the approved catalog are signed with the corporate key.
+  - name: approvedRepository
+    displayName: Approved Harbor repository (ör. approved/ssi-remediation-test)
+    type: string
+    default: approved/ssi-remediation-test
+  - name: approvedDigest
+    displayName: Immutable approved digest (sha256:...)
+    type: string
+    default: ''
+  - name: remediationJobId
+    displayName: RM-EXEC job id (kanıtın iliştirileceği iş)
+    type: string
+    default: ''
+  - name: sourceDigest
+    displayName: Kaynak (dış imaj) digest — OPSİYONEL, boş bırakılabilir
+    type: string
+    default: ''
+  - name: postToSsi
+    displayName: Kanıtı SSI intake'ine gönder
+    type: boolean
+    default: false
+  # Only the SSI addresses listed here can be chosen; Azure DevOps refuses any other value
+  # (UI and REST API alike). A new SSI address is a reviewed change to this list.
+  - name: ssiApiBaseUrl
+    displayName: SSI API base URL
+    type: string
+    default: http://10.0.0.10:5021/api/v1
+    values:
+      - http://10.0.0.10:5021/api/v1
+      - http://ssi.example.com/api/v1
+  # Allows plain HTTP to the listed SSI address. TLS verification is never switched off.
+  - name: allowInsecurePocApi
+    displayName: PoC HTTP API'ye izin ver
+    type: boolean
+    default: false
+
+pool: 'LinuxPool'
+
+# Values in this block are fixed: Azure DevOps does not let a run override a variable
+# defined in the YAML file, at queue time or through the REST API.
+variables:
+  HARBOR_HOST: registry.example.com
+  HARBOR_PROJECT: ssi-images
+  HARBOR_HOST_IP: 10.0.0.20
+  # Open-source signing tools, pinned by version AND by the SHA-256 published with each release
+  # (cosign_checksums.txt, syft_<version>_checksums.txt). A download that does not match is never
+  # executed. To upgrade: change the version and its checksum together, from the release page.
+  SYFT_VERSION: v1.20.0
+  SYFT_LINUX_AMD64_SHA256: 689e12c5cbf67521ce61b9c126068f9eaabe1223e77971b2fede50033ff6b5cc
+  COSIGN_VERSION: v2.4.1
+  COSIGN_LINUX_AMD64_SHA256: 8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b
+
+stages:
+  - stage: SupplyChainSign
+    displayName: 'Sign approved image + SBOM + provenance'
+    jobs:
+      - job: SignImmutableApprovedArtifact
+        displayName: 'Cosign sign + Syft SBOM + attest (open source)'
+        steps:
+          # Inputs are checked before any secret is mapped into a step.
+          - script: |
+              set -euo pipefail
+
+              # A Harbor repository under approved/ (approved/<name> or approved/<team>/<name>),
+              # each part a lower-case registry path component: no '..', no empty parts.
+              component='[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*'
+              if [[ ! "${APPROVED_REPOSITORY}" =~ ^approved(/${component})+$ ]]; then
+                echo 'approvedRepository must be a repository under approved/ (for example approved/nginx).'
+                echo 'Only images in the approved catalog are signed with the corporate key.'
+                exit 2
+              fi
+              if [[ ! "${APPROVED_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'approvedDigest must be a complete immutable sha256 digest. Tags are intentionally rejected.'
+                exit 2
+              fi
+              if [[ -n "${SOURCE_DIGEST}" && ! "${SOURCE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'sourceDigest must be empty or a complete sha256 digest.'
+                exit 2
+              fi
+              if [[ -n "${REMEDIATION_JOB_ID}" && ! "${REMEDIATION_JOB_ID}" =~ ^RM-EXEC-[0-9]{4,}$ ]]; then
+                echo 'remediationJobId must be empty or use the RM-EXEC-0001 format.'
+                exit 2
+              fi
+              echo "Signing input accepted: ${APPROVED_REPOSITORY}@${APPROVED_DIGEST}"
+            displayName: 'Validate signing inputs'
+            env:
+              APPROVED_REPOSITORY: ${{ parameters.approvedRepository }}
+              APPROVED_DIGEST: ${{ parameters.approvedDigest }}
+              SOURCE_DIGEST: ${{ parameters.sourceDigest }}
+              REMEDIATION_JOB_ID: ${{ parameters.remediationJobId }}
+
+          # Tools are downloaded and verified in a step that holds no secret: nothing that
+          # runs here can read the signing key, and an unverified binary never runs later.
+          - script: |
+              set -euo pipefail
+
+              BIN_DIR="$(Pipeline.Workspace)/supply-chain/bin"
+              DOWNLOAD_DIR="$(Pipeline.Workspace)/supply-chain/downloads"
+              rm -rf "${BIN_DIR}" "${DOWNLOAD_DIR}"
+              mkdir -p "${BIN_DIR}" "${DOWNLOAD_DIR}"
+
+              # Downloads a release asset and refuses it unless its SHA-256 is the pinned one.
+              fetch_verified() {
+                local url="$1" expected="$2" output="$3"
+                if [[ ! "${expected}" =~ ^[a-f0-9]{64}$ ]]; then
+                  echo "No pinned SHA-256 for ${url}; refusing to download."
+                  return 2
+                fi
+                curl -sSfL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 -o "${output}" "${url}"
+                if ! printf '%s  %s\n' "${expected}" "${output}" | sha256sum --check --status; then
+                  echo "Checksum mismatch for ${url}: the file was deleted and is not used."
+                  rm -f "${output}"
+                  return 3
+                fi
+                echo "Verified ${url##*/} (sha256:${expected})."
+              }
+
+              fetch_verified \
+                "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VERSION#v}_linux_amd64.tar.gz" \
+                "${SYFT_LINUX_AMD64_SHA256}" "${DOWNLOAD_DIR}/syft.tar.gz"
+              tar -xzf "${DOWNLOAD_DIR}/syft.tar.gz" -C "${BIN_DIR}" syft
+
+              fetch_verified \
+                "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+                "${COSIGN_LINUX_AMD64_SHA256}" "${BIN_DIR}/cosign"
+
+              chmod 755 "${BIN_DIR}/syft" "${BIN_DIR}/cosign"
+              rm -rf "${DOWNLOAD_DIR}"
+              "${BIN_DIR}/syft" version | sed -n '1,3p'
+              "${BIN_DIR}/cosign" version 2>/dev/null | sed -n '/GitVersion/p'
+            displayName: 'Install pinned signing tools (checksum verified)'
+            env:
+              SYFT_VERSION: $(SYFT_VERSION)
+              SYFT_LINUX_AMD64_SHA256: $(SYFT_LINUX_AMD64_SHA256)
+              COSIGN_VERSION: $(COSIGN_VERSION)
+              COSIGN_LINUX_AMD64_SHA256: $(COSIGN_LINUX_AMD64_SHA256)
+
+          - script: |
+              set -euo pipefail
+
+              for name in HARBOR_ROBOT_USERNAME HARBOR_ROBOT_SECRET COSIGN_PRIVATE_KEY COSIGN_PASSWORD COSIGN_PUBLIC_KEY; do
+                if [[ -z "${!name:-}" ]]; then
+                  echo "Required secret ${name} is not set on this pipeline."
+                  exit 1
+                fi
+              done
+              command -v jq >/dev/null 2>&1 || { echo 'jq is required.'; exit 1; }
+
+              # Windows kopyala-yapıştır kaynaklı gizli \r / \n karakterlerini paroladan temizle.
+              # (Anahtar da aynı şekilde \r'sız üretildiği için iki taraf da temiz → eşleşir.)
+              COSIGN_PASSWORD="$(printf '%s' "${COSIGN_PASSWORD}" | tr -d '\r\n')"
+
+              RUN_DIR="$(Pipeline.Workspace)/supply-chain"
+              BIN_DIR="${RUN_DIR}/bin"
+              mkdir -p "${RUN_DIR}/docker"
+              chmod 700 "${RUN_DIR}/docker"
+              # Only the binaries the previous step verified; nothing is downloaded here.
+              for tool in syft cosign; do
+                [[ -x "${BIN_DIR}/${tool}" ]] || { echo "${tool} was not installed by the verified install step."; exit 1; }
+              done
+              export PATH="${BIN_DIR}:${PATH}"
+              trap 'rm -rf "${RUN_DIR}/docker" "${RUN_DIR}/cosign.key" "${RUN_DIR}/cosign.pub"' EXIT
+
+              IMAGE="${HARBOR_HOST}/${HARBOR_PROJECT}/${APPROVED_REPOSITORY}@${APPROVED_DIGEST}"
+              echo "Signing immutable approved image: ${IMAGE}"
+
+              # Harbor auth'u geçici bir docker config'e ver (cosign/syft registry için okur).
+              harbor_auth="$(printf '%s:%s' "${HARBOR_ROBOT_USERNAME}" "${HARBOR_ROBOT_SECRET}" | base64 -w 0)"
+              printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${HARBOR_HOST}" "${harbor_auth}" > "${RUN_DIR}/docker/config.json"
+              chmod 600 "${RUN_DIR}/docker/config.json"
+              unset harbor_auth
+              export DOCKER_CONFIG="${RUN_DIR}/docker"
+
+              # Cosign anahtar materyalini secret'tan geçici dosyaya yaz (log'a düşmez).
+              # Anahtarlar Azure secret'ında BASE64 (tek satır) tutulur — çok satırlı PEM
+              # yapıştırma tuzağını önler. Burada çözülür.
+              printf '%s' "${COSIGN_PRIVATE_KEY}" | base64 -d > "${RUN_DIR}/cosign.key"
+              printf '%s' "${COSIGN_PUBLIC_KEY}" | base64 -d > "${RUN_DIR}/cosign.pub"
+              chmod 600 "${RUN_DIR}/cosign.key"
+
+              # Teşhis (sır değil): anahtar düzgün çözüldü mü + parola uzunluğu.
+              echo "diag: cosign.key ilk satır -> $(head -1 "${RUN_DIR}/cosign.key")"
+              echo "diag: cosign.key bayt=$(wc -c < "${RUN_DIR}/cosign.key") | COSIGN_PASSWORD uzunluk=${#COSIGN_PASSWORD}"
+
+              # Anahtar/parola uyumunu ERKEN doğrula — net hata mesajı için (fail fast).
+              if ! COSIGN_PASSWORD="${COSIGN_PASSWORD}" cosign public-key --key "${RUN_DIR}/cosign.key" > /dev/null 2>&1; then
+                echo 'HATA: COSIGN_PASSWORD ile COSIGN_PRIVATE_KEY uyuşmuyor (decrypt failed).'
+                echo 'Kontrol: üç secret da AYNI generate-key-pair koşusundan olmalı; parolada baştaki/sondaki boşluk olmamalı.'
+                exit 1
+              fi
+              echo 'Cosign anahtar/parola uyumu doğrulandı.'
+
+              # 1) SBOM (CycloneDX JSON).
+              syft "${IMAGE}" -o cyclonedx-json="${RUN_DIR}/sbom.cyclonedx.json"
+              SBOM_DIGEST="sha256:$(sha256sum "${RUN_DIR}/sbom.cyclonedx.json" | cut -d' ' -f1)"
+              COMPONENT_COUNT="$(jq '(.components // []) | length' "${RUN_DIR}/sbom.cyclonedx.json")"
+              KEY_ID="cosign/ssi-publish (sha256:$(sha256sum "${RUN_DIR}/cosign.pub" | cut -c1-12))"
+
+              # 2) İmza (iç Harbor: Rekor transparency log kapalı).
+              COSIGN_PASSWORD="${COSIGN_PASSWORD}" cosign sign --yes --key "${RUN_DIR}/cosign.key" --tlog-upload=false "${IMAGE}"
+
+              # 3) SBOM attestation (CycloneDX predicate).
+              COSIGN_PASSWORD="${COSIGN_PASSWORD}" cosign attest --yes --predicate "${RUN_DIR}/sbom.cyclonedx.json" \
+                --type cyclonedx --key "${RUN_DIR}/cosign.key" --tlog-upload=false "${IMAGE}"
+
+              # 4) Provenance attestation (kaynak digest'e kadar izlenebilirlik).
+              jq -n \
+                --arg image "${IMAGE}" \
+                --arg subjectHex "${APPROVED_DIGEST#sha256:}" \
+                --arg sourceHex "$(printf '%s' "${SOURCE_DIGEST}" | tr -d '[:space:]' | sed 's/^sha256://')" \
+                --arg builder "${SYSTEM_COLLECTIONURI:-azure-devops}${SYSTEM_TEAMPROJECT:-}/_build?buildId=${BUILD_BUILDID:-0}" \
+                --arg jobId "${REMEDIATION_JOB_ID}" \
+                --arg buildRef "${BUILD_BUILDURI:-}" \
+                '{
+                  buildType: "https://example.com/ssi/remediation/v1",
+                  builder: { id: $builder },
+                  invocation: { configSource: { digest: { sha256: $sourceHex } } },
+                  subject: [ { name: $image, digest: { sha256: $subjectHex } } ],
+                  metadata: { remediationJobId: $jobId, buildRef: $buildRef }
+                }' > "${RUN_DIR}/provenance.json"
+              COSIGN_PASSWORD="${COSIGN_PASSWORD}" cosign attest --yes --predicate "${RUN_DIR}/provenance.json" \
+                --type slsaprovenance --key "${RUN_DIR}/cosign.key" --tlog-upload=false "${IMAGE}"
+              PROV_DIGEST="sha256:$(sha256sum "${RUN_DIR}/provenance.json" | cut -d' ' -f1)"
+
+              # 5) Öz-doğrulama (public key ile; imza + iki attestation).
+              cosign verify --key "${RUN_DIR}/cosign.pub" --insecure-ignore-tlog=true "${IMAGE}" > /dev/null
+              cosign verify-attestation --type cyclonedx --key "${RUN_DIR}/cosign.pub" --insecure-ignore-tlog=true "${IMAGE}" > /dev/null
+              cosign verify-attestation --type slsaprovenance --key "${RUN_DIR}/cosign.pub" --insecure-ignore-tlog=true "${IMAGE}" > /dev/null
+              echo 'Cosign signature + CycloneDX SBOM + provenance attestations verified.'
+
+              # 6) SSI intake için kanıt receipt'ini oluştur (imzalama sırları ASLA konmaz).
+              jq -n \
+                --arg outputDigest "${APPROVED_DIGEST}" \
+                --arg keyId "${KEY_ID}" \
+                --arg signedDigest "${APPROVED_DIGEST}" \
+                --arg sbomDigest "${SBOM_DIGEST}" \
+                --argjson componentCount "${COMPONENT_COUNT}" \
+                --arg provDigest "${PROV_DIGEST}" \
+                --arg sourceDigest "${SOURCE_DIGEST}" \
+                --arg buildRef "${BUILD_BUILDURI:-}" \
+                --arg cosignVersion "${COSIGN_VERSION}" \
+                --arg syftVersion "${SYFT_VERSION}" \
+                '{
+                  contractVersion: "ssi.supply-chain/v1alpha1",
+                  outputDigest: $outputDigest,
+                  verifier: "worker-cosign",
+                  signature: { signed: true, verified: true, keyId: $keyId, signedDigest: $signedDigest, tool: ("cosign " + $cosignVersion) },
+                  sbom: { format: "cyclonedx-json", sbomDigest: $sbomDigest, componentCount: $componentCount, verified: true, tool: ("syft " + $syftVersion) },
+                  provenance: { attestationDigest: $provDigest, sourceDigest: $sourceDigest, subjectDigest: $outputDigest, buildRef: $buildRef, verified: true, predicateType: "https://slsa.dev/provenance/v1" }
+                }' > "${RUN_DIR}/supply-chain-evidence.json"
+              echo 'Supply-chain evidence receipt prepared.'
+
+              # Yalnızca kanıt dosyalarını yayınla (binary'ler ve anahtar materyali HARİÇ).
+              mkdir -p "${RUN_DIR}/out"
+              cp "${RUN_DIR}/sbom.cyclonedx.json" "${RUN_DIR}/provenance.json" "${RUN_DIR}/supply-chain-evidence.json" "${RUN_DIR}/out/"
+
+              # 7) (Optional) Deliver the receipt to SSI — BEST EFFORT (signing already succeeded).
+              # The worker channel is authenticated with an HMAC over the exact body
+              # (purpose ssi-supply-chain-evidence-v1, job id, worker id, timestamp, digest).
+              # If SSI is unreachable or the secret is not configured, the run does NOT fail:
+              # the receipt is published as an artifact and an operator uploads it from the
+              # RM-EXEC "Upload evidence" card (audited as a manual upload). The run then ends as
+              # "Succeeded with issues", so a missed delivery is visible instead of a quiet green.
+              ssi_delivery_missed() {
+                echo "##vso[task.logissue type=warning]$1"
+                echo '##vso[task.complete result=SucceededWithIssues;]Signing succeeded; the evidence was not delivered to SSI.'
+              }
+              if [[ "${POST_TO_SSI}" == "True" || "${POST_TO_SSI}" == "true" ]]; then
+                if [[ -z "${REMEDIATION_JOB_ID}" ]]; then
+                  echo 'WARNING: remediationJobId is empty; skipping SSI delivery. The receipt is published as an artifact.'
+                  ssi_delivery_missed 'SSI delivery skipped: remediationJobId is empty. Upload the supply-chain-evidence artifact from the UI.'
+                elif [[ -z "${SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET:-}" || "${SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET}" == \$\(* ]]; then
+                  echo 'WARNING: SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET is not set; skipping signed delivery. Upload the artifact from the UI.'
+                  ssi_delivery_missed 'SSI delivery skipped: SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET is not set. Upload the supply-chain-evidence artifact from the UI.'
+                elif [[ "${SSI_API_BASE_URL}" != https://* && "$(printf '%s' "${ALLOW_INSECURE_POC_API}" | tr '[:upper:]' '[:lower:]')" != 'true' ]]; then
+                  echo 'WARNING: the SSI address is plain HTTP and allowInsecurePocApi is false; skipping delivery.'
+                  ssi_delivery_missed 'SSI delivery skipped: plain HTTP was not allowed for this run. Upload the supply-chain-evidence artifact from the UI.'
+                else
+                  WORKER_ID="$(printf '%s' "${AGENT_NAME:-supply-chain-worker}" | tr -c 'A-Za-z0-9._:-' '-' | cut -c1-128)"
+                  HEADERS_FILE="${RUN_DIR}/ssi-headers.txt"
+                  EVIDENCE_FILE="${RUN_DIR}/supply-chain-evidence.json" JOB_ID="${REMEDIATION_JOB_ID}" WORKER_ID="${WORKER_ID}" \
+                    node <<'NODE' > "${HEADERS_FILE}"
+              const { createHash, createHmac } = require('node:crypto');
+              const { readFileSync } = require('node:fs');
+              const body = readFileSync(process.env.EVIDENCE_FILE);
+              const secret = process.env.SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET;
+              if (Buffer.byteLength(secret, 'utf8') < 32) {
+                console.error('SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET must contain at least 32 bytes.');
+                process.exit(1);
+              }
+              const timestamp = Math.floor(Date.now() / 1000);
+              const contentDigest = `sha256:${createHash('sha256').update(body).digest('hex')}`;
+              const payload = ['ssi-supply-chain-evidence-v1', timestamp, process.env.JOB_ID, process.env.WORKER_ID, contentDigest].join('\n');
+              const signature = createHmac('sha256', secret).update(payload).digest('hex');
+              console.log(`X-SSI-Evidence-Version: v1`);
+              console.log(`X-SSI-Evidence-Timestamp: ${timestamp}`);
+              console.log(`X-SSI-Evidence-Content-SHA256: ${contentDigest}`);
+              console.log(`X-SSI-Evidence-Worker-ID: ${process.env.WORKER_ID}`);
+              console.log(`X-SSI-Evidence-Signature: sha256=${signature}`);
+              NODE
+                  set +e
+                  http_code="$(curl -sS --connect-timeout 15 --max-time 60 -o "${RUN_DIR}/ssi-response.json" -w '%{http_code}' \
+                    -X POST "${SSI_API_BASE_URL%/}/remediation/${REMEDIATION_JOB_ID}/worker-supply-chain-evidence" \
+                    -H 'Content-Type: application/json' \
+                    -H @"${HEADERS_FILE}" \
+                    --data-binary @"${RUN_DIR}/supply-chain-evidence.json")"
+                  curl_rc=$?
+                  set -e
+                  rm -f "${HEADERS_FILE}"
+                  if [[ "${http_code}" == "200" ]]; then
+                    echo "SSI intake: 200 OK — evidence attached to ${REMEDIATION_JOB_ID} (channel=worker)."
+                  else
+                    echo "WARNING: SSI intake failed (http=${http_code:-none}, curl_rc=${curl_rc}). The agent may not reach SSI."
+                    echo "SIGNING SUCCEEDED. The receipt is in the 'supply-chain-evidence' artifact; upload it from UI → RM-EXEC → Upload evidence."
+                    [[ "${http_code}" =~ ^4 ]] && cat "${RUN_DIR}/ssi-response.json" || true
+                    ssi_delivery_missed "SSI intake failed (http=${http_code:-none}, curl_rc=${curl_rc}). Upload the supply-chain-evidence artifact from the UI."
+                  fi
+                fi
+              else
+                echo 'postToSsi=false → the receipt is published as an artifact only.'
+              fi
+            displayName: 'Sign + SBOM + attest + verify + (optional) post to SSI'
+            env:
+              APPROVED_REPOSITORY: ${{ parameters.approvedRepository }}
+              APPROVED_DIGEST: ${{ parameters.approvedDigest }}
+              REMEDIATION_JOB_ID: ${{ parameters.remediationJobId }}
+              SOURCE_DIGEST: ${{ parameters.sourceDigest }}
+              POST_TO_SSI: ${{ parameters.postToSsi }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              ALLOW_INSECURE_POC_API: ${{ parameters.allowInsecurePocApi }}
+              HARBOR_ROBOT_USERNAME: $(HARBOR_ROBOT_USERNAME)
+              HARBOR_ROBOT_SECRET: $(HARBOR_ROBOT_SECRET)
+              COSIGN_PRIVATE_KEY: $(COSIGN_PRIVATE_KEY)
+              COSIGN_PASSWORD: $(COSIGN_PASSWORD)
+              COSIGN_PUBLIC_KEY: $(COSIGN_PUBLIC_KEY)
+              SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET: $(SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish SBOM + provenance + evidence receipt'
+            # Adım hata verse bile kanıtı yayınla (UI'dan yüklenebilsin) — asla kaybolmasın.
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/supply-chain/out'
+              ArtifactName: 'supply-chain-evidence'
+              publishLocation: 'Container'
+
+          - script: rm -rf "$(Pipeline.Workspace)/supply-chain/docker" "$(Pipeline.Workspace)/supply-chain/cosign.key"
+            displayName: 'Remove temporary credentials and signing key'
+            condition: always()

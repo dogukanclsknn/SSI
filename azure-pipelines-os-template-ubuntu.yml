@@ -1,0 +1,282 @@
+# SSI Ubuntu OS template worker (docs/os-template-poc.md, "Ubuntu (offline build)").
+#
+# Builds an up-to-date Ubuntu 24.04 template from the official cloud image, offline, without
+# booting a VM: pin the image by SHA-256, scan its dpkg database with Trivy, apt full-upgrade
+# inside the image (libguestfs virt-customize), keep only the newest kernel, re-scan and gate (no
+# vulnerability with a fix may remain), seal, then export QCOW2 (Proxmox/KVM), OVA (vSphere) and
+# VHDX (Hyper-V) with SHA256SUMS and template-manifest.json. The work is
+# poc/os-template/linux/build-ubuntu-template.sh from this checkout.
+#
+# Runs on LinuxPool in an unprivileged builder container (poc/os-template/linux/Dockerfile: no
+# --privileged, no Docker socket). /dev/kvm is passed in when the agent has it; without it qemu
+# emulates and the build is slower. The Trivy database is downloaded by the pinned Trivy image
+# (the same digest as the canonical scan worker) and used offline. The verified cloud image is
+# cached on the agent by its SHA-256; the template files are published as one run artifact per
+# format (os-template-ubuntu-qcow2, -ova, -vhdx; SSI offers them for download) and every work
+# file of the run is removed afterwards.
+#
+# Started from SSI (OS Templates) for a build request OST-…, SSI sets the parameters and
+# deliverToSsi=true; the run sends the template manifest back HMAC-signed
+# (ssi.os-template-build/v1, scripts/os-template-evidence.mjs, secret
+# SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET). Started by hand, deliverToSsi stays false.
+trigger: none
+pr: none
+
+parameters:
+  - name: baseImageUrl
+    displayName: Official Ubuntu 24.04 cloud image URL (cloud-images.ubuntu.com, .img)
+    type: string
+    default: https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img
+  - name: baseImageSha256
+    displayName: Cloud image SHA-256 (64 hex from its SHA256SUMS, required)
+    type: string
+    default: ''
+  - name: templateName
+    displayName: Template name
+    type: string
+    default: ssi-ubuntu-2404
+  - name: diskSizeGb
+    displayName: Template disk size in GiB (the root partition is grown to it)
+    type: string
+    default: '20'
+  # Azure DevOps refuses to start a manual run with an empty string parameter, so "none" is the
+  # value for "not set".
+  - name: aptMirror
+    displayName: Internal Ubuntu mirror (none = archive.ubuntu.com)
+    type: string
+    default: none
+  - name: osTemplateBuildId
+    displayName: SSI build request (OST-0001; only with deliverToSsi, otherwise none)
+    type: string
+    default: none
+  - name: deliverToSsi
+    displayName: Deliver the signed result to SSI
+    type: boolean
+    default: false
+  # Fixed like the other workers': a run can only call this SSI back (docs/azure-devops-integration.md).
+  - name: ssiApiBaseUrl
+    displayName: SSI API base URL (only with deliverToSsi)
+    type: string
+    default: http://10.0.0.10:5021/api/v1
+    values:
+      - http://10.0.0.10:5021/api/v1
+      - http://ssi.example.com/api/v1
+  - name: allowInsecurePocApi
+    displayName: Allow a plain HTTP SSI address (internal PoC)
+    type: boolean
+    default: false
+
+pool: 'LinuxPool'
+
+variables:
+  # Official Trivy v0.70.0 multi-platform manifest, pinned by digest (as in the canonical scan).
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+  # Free space the run needs on the agent: cloud image, work disk and the three exports.
+  MIN_FREE_GB: '25'
+
+stages:
+  - stage: UbuntuTemplate
+    displayName: 'Ubuntu template'
+    jobs:
+      - job: BuildTemplate
+        displayName: 'Build the Ubuntu 24.04 template'
+        timeoutInMinutes: 240
+        steps:
+          - checkout: self
+
+          - script: |
+              set -euo pipefail
+              run="${PIPELINE_WORKSPACE}/os-template-ubuntu"
+              evidence="${BUILD_ARTIFACTSTAGINGDIRECTORY}/os-template-ubuntu"
+              mkdir -p "${evidence}"
+
+              # The reason is also written to the evidence folder, so the artifact step never
+              # fails with a second, misleading "Not found PathtoPublish" error.
+              fail() {
+                printf '%s\n' "$1" > "${evidence}/failure.txt"
+                echo "##vso[task.logissue type=error]$1"
+                exit 1
+              }
+              # A parameter value shown in a message: one line, at most 200 characters, no logging commands.
+              shown() { printf '%s' "$1" | tr '\r\n' '  ' | cut -c1-200 | sed 's/##vso\[/##vso_[/g'; }
+              trim() { local value="$1"; value="${value#"${value%%[![:space:]]*}"}"; printf '%s' "${value%"${value##*[![:space:]]}"}"; }
+
+              # --- Input validation (fail-closed, before anything is downloaded or built) ---
+              url="$(trim "${SSI_TEMPLATE_BASE_IMAGE_URL}")"
+              sha="$(trim "${SSI_TEMPLATE_BASE_IMAGE_SHA256}" | tr 'A-F' 'a-f')"
+              name="$(trim "${SSI_TEMPLATE_NAME}")"
+              size="$(trim "${SSI_TEMPLATE_DISK_SIZE_GB}")"
+              mirror="$(trim "${SSI_TEMPLATE_APT_MIRROR}")"
+              [[ "${mirror}" == none ]] && mirror=''
+              [[ "${url}" =~ ^https://cloud-images\.ubuntu\.com/[A-Za-z0-9._/-]+/[A-Za-z0-9._-]+\.img$ && "${url}" != *..* ]] ||
+                fail "baseImageUrl must be an official https://cloud-images.ubuntu.com/... .img URL (received: $(shown "${url}"))."
+              [[ "${sha}" =~ ^[a-f0-9]{64}$ ]] || fail 'baseImageSha256 must be the 64-hex SHA-256 of the cloud image; the build refuses an unpinned image.'
+              [[ "${name}" =~ ^[a-z0-9][a-z0-9-]{1,40}$ ]] || fail "templateName may hold lower-case letters, digits and dashes (received: $(shown "${name}"))."
+              [[ "${size}" =~ ^[0-9]+$ ]] && (( size >= 10 && size <= 200 )) || fail "diskSizeGb must be 10-200 (received: $(shown "${size}"))."
+              if [[ -n "${mirror}" && ! "${mirror}" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+                fail "aptMirror must be an http(s) URL without credentials or query (received: $(shown "${mirror}"))."
+              fi
+              deliver="$(printf '%s' "${SSI_TEMPLATE_DELIVER}" | tr 'A-Z' 'a-z')"
+              [[ "${deliver}" == true || "${deliver}" == false ]] || fail 'deliverToSsi must be true or false.'
+              if [[ "${deliver}" == true ]]; then
+                request="$(trim "${SSI_TEMPLATE_BUILD_REQUEST}")"
+                api="$(trim "${SSI_API_BASE_URL}")"
+                [[ "${request}" =~ ^OST-[0-9]{4,}$ ]] || fail "osTemplateBuildId must look like OST-0001 when deliverToSsi is true (received: $(shown "${request}"))."
+                [[ "${api}" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]] || fail "ssiApiBaseUrl must be an http(s) URL without credentials or query (received: $(shown "${api}"))."
+                if [[ "${api}" == http://* && "$(printf '%s' "${SSI_ALLOW_INSECURE_POC_API}" | tr 'A-Z' 'a-z')" != true ]]; then
+                  fail 'ssiApiBaseUrl is plain HTTP; allowInsecurePocApi must be true for the internal PoC.'
+                fi
+                secret="${SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET:-}"
+                if (( ${#secret} < 32 )) || [[ "${secret}" == *'$('* ]]; then
+                  fail 'The pipeline secret SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET is not set; the result could not be delivered.'
+                fi
+                unset secret
+              fi
+              command -v docker >/dev/null || fail 'Docker is required on this agent for the builder container.'
+              mkdir -p "${run}"
+              free_gb="$(df -Pk "${run}" | awk 'NR == 2 { print int($4 / 1048576) }')"
+              (( free_gb >= MIN_FREE_GB )) || fail "Only ${free_gb} GB free under ${PIPELINE_WORKSPACE}; the build needs ${MIN_FREE_GB} GB."
+
+              # --- Builder image and the Trivy database (both pinned) ---
+              builder="ssi-os-template-builder:${BUILD_BUILDID}"
+              docker build --pull -t "${builder}" --build-arg "TRIVY_IMAGE=${TRIVY_IMAGE}" \
+                -f "${BUILD_SOURCESDIRECTORY}/poc/os-template/linux/Dockerfile" "${BUILD_SOURCESDIRECTORY}/poc/os-template/linux" || fail 'The builder image could not be built.'
+              mkdir -p "${run}/trivy-cache" "${run}/work" "${run}/home" "${SSI_IMAGE_CACHE}"
+              docker run --rm --network host --user "$(id -u):$(id -g)" -v "${run}/trivy-cache:/cache" \
+                "${TRIVY_IMAGE}" image --download-db-only --cache-dir /cache --quiet ||
+                fail 'The Trivy vulnerability database could not be downloaded.'
+
+              # --- Build (unprivileged; /dev/kvm only when the agent has it) ---
+              kvm=()
+              if [[ -c /dev/kvm ]]; then kvm=(--device /dev/kvm --group-add "$(stat -c %g /dev/kvm)"); fi
+              status=0
+              docker run --rm --network host --user "$(id -u):$(id -g)" "${kvm[@]}" \
+                -v "${BUILD_SOURCESDIRECTORY}/poc/os-template:/poc:ro" \
+                -v "${run}:/run-dir" -v "${SSI_IMAGE_CACHE}:/image-cache" \
+                -e HOME=/run-dir/home \
+                -e BASE_IMAGE_URL="${url}" -e BASE_IMAGE_SHA256="${sha}" \
+                -e TEMPLATE_NAME="${name}" -e BUILD_ID="ado-${BUILD_BUILDID}" \
+                -e WORK_DIR=/run-dir/work/build -e CACHE_DIR=/image-cache \
+                -e TRIVY_CACHE_DIR=/run-dir/trivy-cache -e DISK_SIZE_GB="${size}" -e APT_MIRROR="${mirror}" \
+                "${builder}" bash /poc/linux/build-ubuntu-template.sh || status=$?
+              if (( status == 1 )); then fail 'The gate refused the template: a vulnerability with a fix is still present (scan-report.md in the evidence).'; fi
+              (( status == 0 )) || fail "The template build failed (exit ${status}); see the log of this step."
+            displayName: 'Validate inputs and build the template'
+            env:
+              SSI_TEMPLATE_BASE_IMAGE_URL: ${{ parameters.baseImageUrl }}
+              SSI_TEMPLATE_BASE_IMAGE_SHA256: ${{ parameters.baseImageSha256 }}
+              SSI_TEMPLATE_NAME: ${{ parameters.templateName }}
+              SSI_TEMPLATE_DISK_SIZE_GB: ${{ parameters.diskSizeGb }}
+              SSI_TEMPLATE_APT_MIRROR: ${{ parameters.aptMirror }}
+              SSI_TEMPLATE_DELIVER: ${{ parameters.deliverToSsi }}
+              SSI_TEMPLATE_BUILD_REQUEST: ${{ parameters.osTemplateBuildId }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              SSI_ALLOW_INSECURE_POC_API: ${{ parameters.allowInsecurePocApi }}
+              SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET: $(SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET)
+              SSI_IMAGE_CACHE: $(Agent.WorkFolder)/ssi-os-template-cache
+
+          - script: |
+              build="${PIPELINE_WORKSPACE}/os-template-ubuntu/work/build"
+              target="${BUILD_ARTIFACTSTAGINGDIRECTORY}/os-template-ubuntu"
+              mkdir -p "${target}"
+              # Scan reports, package lists, the release file of the sealed disk, the manifest and
+              # the checksums; the disk images go to their own artifacts.
+              if [[ -d "${build}/reports" ]]; then cp -r "${build}/reports/." "${target}/"; fi
+              for file in template-manifest.json SHA256SUMS; do
+                if [[ -f "${build}/out/${file}" ]]; then cp "${build}/out/${file}" "${target}/"; fi
+              done
+              exit 0
+            displayName: 'Collect evidence'
+            condition: succeededOrFailed()
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish template evidence'
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/os-template-ubuntu'
+              ArtifactName: 'os-template-ubuntu-evidence'
+              publishLocation: 'Container'
+
+          # One artifact per disk format, so a VMware user downloads only the OVA (also through
+          # SSI, src/lib/osTemplateDownloads.js). Moved, not copied: the disk stays on one place.
+          - script: |
+              set -euo pipefail
+              out="${PIPELINE_WORKSPACE}/os-template-ubuntu/work/build/out"
+              publish="${PIPELINE_WORKSPACE}/os-template-ubuntu/publish"
+              for format in qcow2 ova vhdx; do
+                mkdir -p "${publish}/${format}"
+                files=("${out}"/*."${format}")
+                if (( ${#files[@]} != 1 )) || [[ ! -f "${files[0]}" ]]; then
+                  echo "##vso[task.logissue type=error]Expected exactly one .${format} file in the build output."
+                  exit 1
+                fi
+                mv "${files[0]}" "${publish}/${format}/"
+              done
+            displayName: 'Stage the template files per format'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish the QCOW2 (Proxmox / KVM)'
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/os-template-ubuntu/publish/qcow2'
+              ArtifactName: 'os-template-ubuntu-qcow2'
+              publishLocation: 'Container'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish the OVA (VMware vSphere)'
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/os-template-ubuntu/publish/ova'
+              ArtifactName: 'os-template-ubuntu-ova'
+              publishLocation: 'Container'
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish the VHDX (Hyper-V)'
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/os-template-ubuntu/publish/vhdx'
+              ArtifactName: 'os-template-ubuntu-vhdx'
+              publishLocation: 'Container'
+
+          # Only to sign and deliver the result with the tested SSI code. Delivered last: SSI
+          # records the template only once every file it will offer is published.
+          - task: UseNode@1
+            displayName: 'Use Node 22'
+            condition: and(succeeded(), eq('${{ parameters.deliverToSsi }}', 'true'))
+            inputs:
+              version: '22.x'
+
+          - script: |
+              set -euo pipefail
+              out="${PIPELINE_WORKSPACE}/os-template-ubuntu/work/build/out"
+              qcow2="$(find "${PIPELINE_WORKSPACE}/os-template-ubuntu/publish/qcow2" -maxdepth 1 -name '*.qcow2' -print -quit)"
+              [[ -n "${qcow2}" ]] || { echo '##vso[task.logissue type=error]The build left no template to report.'; exit 1; }
+              result="${PIPELINE_WORKSPACE}/os-template-ubuntu/ssi-result.json"
+              request="${SSI_TEMPLATE_BUILD_REQUEST//[[:space:]]/}"
+              api="${SSI_API_BASE_URL//[[:space:]]/}"
+              allow_http="$(printf '%s' "${SSI_ALLOW_INSECURE_POC_API}" | tr 'A-Z' 'a-z')"
+              # The template files live in this run's artifacts, named by the published path.
+              node "${BUILD_SOURCESDIRECTORY}/scripts/os-template-evidence.mjs" assemble --manifest "${out}/template-manifest.json" \
+                --build-id "${request}" --location-host 'azure-devops' \
+                --location-path "os-template-ubuntu-qcow2/$(basename "${qcow2}")" --out "${result}" \
+                --pipeline "${BUILD_DEFINITIONNAME}" --ado-build-id "${BUILD_BUILDID}" --agent "${AGENT_NAME}"
+              node "${BUILD_SOURCESDIRECTORY}/scripts/os-template-evidence.mjs" deliver --file "${result}" --api-base-url "${api}" \
+                --allow-http "${allow_http}" --worker-id "ado-${BUILD_BUILDID}-${AGENT_NAME}"
+            displayName: 'Deliver the signed result to SSI'
+            condition: and(succeeded(), eq('${{ parameters.deliverToSsi }}', 'true'))
+            env:
+              SSI_TEMPLATE_BUILD_REQUEST: ${{ parameters.osTemplateBuildId }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              SSI_ALLOW_INSECURE_POC_API: ${{ parameters.allowInsecurePocApi }}
+              SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET: $(SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET)
+
+          - script: |
+              # Only this run: its work directory and its builder image. The verified cloud
+              # images in the agent cache are kept, except copies unused for 30 days.
+              rm -rf "${PIPELINE_WORKSPACE}/os-template-ubuntu"
+              docker image rm "ssi-os-template-builder:${BUILD_BUILDID}" >/dev/null 2>&1 || true
+              if [[ -d "${SSI_IMAGE_CACHE}" ]]; then
+                find "${SSI_IMAGE_CACHE}" -maxdepth 1 -type f -name '*.img*' -mtime +30 -print -delete
+              fi
+              echo "Cleanup done: only this run's files were removed."
+            displayName: 'Cleanup (only this run)'
+            condition: always()
+            env:
+              SSI_IMAGE_CACHE: $(Agent.WorkFolder)/ssi-os-template-cache

@@ -1,0 +1,155 @@
+services:
+  # Kalıcılık veritabanı (Casey: ayrı sunucuya gerek yok, docker postgres yeterli).
+  # Yalnızca PERSISTENCE_DRIVER=postgres iken kullanılır; memory modunda boşta durur.
+  #
+  # Veri, deploy dizininin DIŞINDA bir host bind-mount'ta tutulur
+  # (SSI_POSTGRES_DATA_DIR, varsayılan /data/ssi-postgres-data). Neden named volume
+  # değil: `docker compose down -v` yalnızca named/anonymous volume'ları siler;
+  # bind-mount bir host dizini olduğu için ona dokunamaz. Böylece pipeline ne
+  # yaparsa yapsın (down -v veya /data/SSI'yi baştan kurma) rol atamaları KORUNUR.
+  # Yedekleme de şeffaf: bu tek dizini pg_dump/tar ile al.
+  ssi-postgres:
+    image: postgres:16-alpine
+    container_name: ssi-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ssi}
+      POSTGRES_USER: ${POSTGRES_USER:-ssi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - ${SSI_POSTGRES_DATA_DIR:-/data/ssi-postgres-data}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ssi} -d ${POSTGRES_DB:-ssi}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Tek seferlik şema göçü (migration). Postgres sağlıklı olunca çalışır, biter.
+  # memory modunda göç atlanır (exit 0) — böylece `ssi` yine başlayabilir.
+  ssi-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ssi:latest
+    container_name: ssi-migrate
+    depends_on:
+      ssi-postgres:
+        condition: service_healthy
+    environment:
+      PERSISTENCE_DRIVER: ${PERSISTENCE_DRIVER:-memory}
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_MIGRATION_URL: ${DATABASE_MIGRATION_URL:-}
+      DATABASE_SSL_MODE: ${DATABASE_SSL_MODE:-verify-full}
+      DATABASE_CA_CERT_PATH: ${DATABASE_CA_CERT_PATH:-}
+      DATABASE_APPLICATION_NAME: ssi-migrate
+    command:
+      - sh
+      - -c
+      - 'if [ "$$PERSISTENCE_DRIVER" = postgres ]; then npm run db:migrate; else echo "memory modu: migration atlandı"; fi'
+    restart: "no"
+
+  ssi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ssi:latest
+    container_name: ssi
+    depends_on:
+      ssi-migrate:
+        condition: service_completed_successfully
+    ports:
+      # Published on all interfaces by default: the external reverse proxy
+      # (ssi.example.com) and the Azure DevOps worker callbacks reach SSI over
+      # the network. Restrict who can reach 5021 with the host/network firewall, or set
+      # SSI_BIND_ADDRESS=127.0.0.1 when the proxy runs on this same host.
+      - "${SSI_BIND_ADDRESS:-0.0.0.0}:5021:5021"
+    environment:
+      HARBOR_URL: ${HARBOR_URL:-}
+      HARBOR_PROJECT: ${HARBOR_PROJECT:-}
+      HARBOR_PROJECTS: ${HARBOR_PROJECTS:-}
+      HARBOR_ROBOT_USERNAME: ${HARBOR_ROBOT_USERNAME:-}
+      HARBOR_ROBOT_SECRET: ${HARBOR_ROBOT_SECRET:-}
+      HARBOR_TLS_VERIFY: ${HARBOR_TLS_VERIFY:-true}
+      SSI_FIXTURES: ${SSI_FIXTURES:-false}
+      PERSISTENCE_DRIVER: ${PERSISTENCE_DRIVER:-memory}
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_MIGRATION_URL: ${DATABASE_MIGRATION_URL:-}
+      DATABASE_SSL_MODE: ${DATABASE_SSL_MODE:-verify-full}
+      DATABASE_CA_CERT_PATH: ${DATABASE_CA_CERT_PATH:-}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
+      DATABASE_CONNECT_TIMEOUT_MS: ${DATABASE_CONNECT_TIMEOUT_MS:-5000}
+      DATABASE_IDLE_TIMEOUT_MS: ${DATABASE_IDLE_TIMEOUT_MS:-30000}
+      DATABASE_APPLICATION_NAME: ${DATABASE_APPLICATION_NAME:-ssi-api}
+      SSI_AUDIT_ACTOR_ID: ${SSI_AUDIT_ACTOR_ID:-ssi-api}
+      SSI_TRUST_ACTOR_HEADER: ${SSI_TRUST_ACTOR_HEADER:-false}
+      SSI_RBAC_ENFORCED: ${SSI_RBAC_ENFORCED:-true}
+      SSI_RBAC_DEFAULT_ROLES: ${SSI_RBAC_DEFAULT_ROLES:-admin}
+      SSI_RBAC_ROLE_BINDINGS: ${SSI_RBAC_ROLE_BINDINGS:-}
+      SSI_RBAC_GROUP_ROLE_MAP: ${SSI_RBAC_GROUP_ROLE_MAP:-}
+      SSI_DEV_LOGIN: ${SSI_DEV_LOGIN:-false}
+      SSI_MULTI_TENANCY: ${SSI_MULTI_TENANCY:-false}
+      LDAP_SERVER: ${LDAP_SERVER:-}
+      LDAP_FQDN: ${LDAP_FQDN:-}
+      LDAP_PORT: ${LDAP_PORT:-636}
+      LDAP_SSL: ${LDAP_SSL:-true}
+      LDAP_VERIFY: ${LDAP_VERIFY:-true}
+      LDAP_CA_FILE: ${LDAP_CA_FILE:-}
+      LDAP_BIND_DN: ${LDAP_BIND_DN:-}
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD:-}
+      LDAP_BASE_DN: ${LDAP_BASE_DN:-}
+      LDAP_USER_FILTER: ${LDAP_USER_FILTER:-(sAMAccountName={username})}
+      LDAP_NETBIOS: ${LDAP_NETBIOS:-}
+      SSI_SESSION_SECRET: ${SSI_SESSION_SECRET:-}
+      SSI_SESSION_COOKIE_SECURE: ${SSI_SESSION_COOKIE_SECURE:-true}
+      SSI_LOCAL_ADMIN_USERNAME: ${SSI_LOCAL_ADMIN_USERNAME:-}
+      SSI_LOCAL_ADMIN_PASSWORD_HASH: ${SSI_LOCAL_ADMIN_PASSWORD_HASH:-}
+      SSI_LOCAL_ADMIN_DISPLAY: ${SSI_LOCAL_ADMIN_DISPLAY:-}
+      SSI_LOCAL_ADMIN_EMAIL: ${SSI_LOCAL_ADMIN_EMAIL:-}
+      SSI_PUBLISH_POLICY_VERSION: ${SSI_PUBLISH_POLICY_VERSION:-ssi.publish-policy/v1.4}
+      SSI_EXCEPTION_MAX_DAYS: ${SSI_EXCEPTION_MAX_DAYS:-90}
+      SSI_EXCEPTION_MAX_DAYS_CRITICAL: ${SSI_EXCEPTION_MAX_DAYS_CRITICAL:-30}
+      SSI_PUBLISH_MAX_CRITICAL: ${SSI_PUBLISH_MAX_CRITICAL:-0}
+      SSI_PUBLISH_MAX_HIGH: ${SSI_PUBLISH_MAX_HIGH:-0}
+      SSI_PUBLISH_REQUIRE_SBOM: ${SSI_PUBLISH_REQUIRE_SBOM:-false}
+      SSI_PUBLISH_REQUIRE_SIGNATURE: ${SSI_PUBLISH_REQUIRE_SIGNATURE:-false}
+      SSI_PUBLISH_REQUIRE_PROVENANCE: ${SSI_PUBLISH_REQUIRE_PROVENANCE:-false}
+      SSI_PUBLISH_REQUIRE_CONSUMER_ACCEPTANCE: ${SSI_PUBLISH_REQUIRE_CONSUMER_ACCEPTANCE:-true}
+      PUBLISH_TARGET_REGISTRY: ${PUBLISH_TARGET_REGISTRY:-registry.example.com}
+      PUBLISH_TARGET_PROJECT: ${PUBLISH_TARGET_PROJECT:-ssi-images}
+      PUBLISH_TARGET_REPOSITORY_PREFIX: ${PUBLISH_TARGET_REPOSITORY_PREFIX:-approved}
+      SSI_PUBLISH_APPROVERS: ${SSI_PUBLISH_APPROVERS:-}
+      SSI_PUBLISH_REQUIRE_SEPARATE_APPROVER: ${SSI_PUBLISH_REQUIRE_SEPARATE_APPROVER:-true}
+      SSI_PUBLISH_HANDOFF_TOKEN: ${SSI_PUBLISH_HANDOFF_TOKEN:-}
+      SSI_PUBLISH_RECEIPT_TOKEN: ${SSI_PUBLISH_RECEIPT_TOKEN:-}
+      SSI_PUBLISH_RECEIPT_HMAC_SECRET: ${SSI_PUBLISH_RECEIPT_HMAC_SECRET:-}
+      SSI_REMEDIATION_EVIDENCE_HMAC_SECRET: ${SSI_REMEDIATION_EVIDENCE_HMAC_SECRET:-}
+      SSI_REMEDIATION_EVIDENCE_MAX_AGE_SECONDS: ${SSI_REMEDIATION_EVIDENCE_MAX_AGE_SECONDS:-300}
+      SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET: ${SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET:-}
+      SSI_CANDIDATE_TEST_EVIDENCE_HMAC_SECRET: ${SSI_CANDIDATE_TEST_EVIDENCE_HMAC_SECRET:-}
+      SSI_CANONICAL_REPORT_HMAC_SECRET: ${SSI_CANONICAL_REPORT_HMAC_SECRET:-}
+      SSI_IMAGE_INSPECTION_EVIDENCE_HMAC_SECRET: ${SSI_IMAGE_INSPECTION_EVIDENCE_HMAC_SECRET:-}
+      SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET: ${SSI_OS_TEMPLATE_EVIDENCE_HMAC_SECRET:-}
+      ONBOARD_TARGET_REGISTRY: ${ONBOARD_TARGET_REGISTRY:-}
+      ONBOARD_TARGET_PROJECT: ${ONBOARD_TARGET_PROJECT:-}
+      ONBOARD_TARGET_REPOSITORY_PREFIX: ${ONBOARD_TARGET_REPOSITORY_PREFIX:-onboarded}
+      ONBOARD_ALLOWED_REGISTRIES: ${ONBOARD_ALLOWED_REGISTRIES:-}
+      ONBOARD_HANDOFF_TOKEN: ${ONBOARD_HANDOFF_TOKEN:-}
+      ONBOARD_RECEIPT_TOKEN: ${ONBOARD_RECEIPT_TOKEN:-}
+      SSI_ONBOARD_RECEIPT_HMAC_SECRET: ${SSI_ONBOARD_RECEIPT_HMAC_SECRET:-}
+      # Azure DevOps automation (docs/azure-devops-integration.md). Empty = manual mode.
+      SSI_ADO_ORG_URL: ${SSI_ADO_ORG_URL:-}
+      SSI_ADO_PROJECT: ${SSI_ADO_PROJECT:-}
+      SSI_ADO_PAT: ${SSI_ADO_PAT:-}
+      SSI_ADO_PIPELINE_REF: ${SSI_ADO_PIPELINE_REF:-refs/heads/main}
+      SSI_ADO_WORKER_API_BASE_URL: ${SSI_ADO_WORKER_API_BASE_URL:-}
+      SSI_ADO_PIPELINE_ONBOARD_IMPORT: ${SSI_ADO_PIPELINE_ONBOARD_IMPORT:-}
+      SSI_ADO_PIPELINE_CANONICAL_SCAN: ${SSI_ADO_PIPELINE_CANONICAL_SCAN:-}
+      SSI_ADO_PIPELINE_COPA_REMEDIATION: ${SSI_ADO_PIPELINE_COPA_REMEDIATION:-}
+      SSI_ADO_PIPELINE_CANDIDATE_TEST: ${SSI_ADO_PIPELINE_CANDIDATE_TEST:-}
+      SSI_ADO_PIPELINE_IMAGE_INSPECTION: ${SSI_ADO_PIPELINE_IMAGE_INSPECTION:-}
+      SSI_ADO_PIPELINE_CONTROLLED_PUBLISH: ${SSI_ADO_PIPELINE_CONTROLLED_PUBLISH:-}
+      SSI_ADO_PIPELINE_SUPPLY_CHAIN_SIGN: ${SSI_ADO_PIPELINE_SUPPLY_CHAIN_SIGN:-}
+      SSI_ADO_PIPELINE_OS_TEMPLATE_WINDOWS: ${SSI_ADO_PIPELINE_OS_TEMPLATE_WINDOWS:-}
+      SSI_ADO_PIPELINE_OS_TEMPLATE_UBUNTU: ${SSI_ADO_PIPELINE_OS_TEMPLATE_UBUNTU:-}
+    restart: unless-stopped

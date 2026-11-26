@@ -1,0 +1,196 @@
+# SSI image inspection worker.
+#
+# Inspects ONE scanned image of the SSI Harbor and reports what a vulnerability scan does not
+# carry: the full OS package inventory, the layers (RootFS diff IDs), the image size and the
+# runtime configuration (environment variable NAMES only; values never leave the agent).
+# The signed ssi.image-inspection/v1 result goes to SSI; Scan Results → "Compare with another
+# image" then compares packages, layers and configuration of two inspected images.
+# An image is inspected once and can be compared with any other inspected image.
+#
+# Safety: nothing is started from the image (no docker run). The image is pulled by digest
+# with a pull-only robot, inspected and removed again. Registry credentials live only in this
+# run's temporary folder.
+trigger: none
+pr: none
+
+parameters:
+  - name: imageReference
+    displayName: Image (harbor/project/repository@sha256:...)
+    type: string
+    default: ''
+  - name: harborCaCertPath
+    displayName: Trusted Harbor CA PEM path, or system
+    type: string
+    default: system
+  - name: deliverToSsi
+    displayName: Deliver the signed result to SSI
+    type: boolean
+    default: true
+
+pool: 'LinuxPool'
+
+variables:
+  HARBOR_HOST: registry.example.com
+  HARBOR_PROJECT: ssi-images
+  HARBOR_HOST_IP: 10.0.0.20
+  # Official Trivy v0.70.0 multi-platform manifest, pinned by digest (same as the other workers).
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+
+stages:
+  - stage: ImageInspection
+    displayName: 'Image inspection'
+    jobs:
+      - job: InspectImage
+        displayName: 'Inspect one image'
+        timeoutInMinutes: 20
+        steps:
+          - checkout: self
+
+          - script: |
+              set -euo pipefail
+              umask 077
+
+              RUN_ID="ssi-inspection-${BUILD_BUILDID:?BUILD_BUILDID is required}"
+              WORK_DIR="${AGENT_TEMPDIRECTORY:?AGENT_TEMPDIRECTORY is required}/${RUN_ID}"
+              EVIDENCE_DIR="${BUILD_ARTIFACTSTAGINGDIRECTORY:?BUILD_ARTIFACTSTAGINGDIRECTORY is required}/image-inspection"
+              TOOL="${BUILD_SOURCESDIRECTORY:?BUILD_SOURCESDIRECTORY is required}/scripts/image-inspection.mjs"
+              IMAGE_REFERENCE="$(printf '%s' "${SSI_INSPECTION_IMAGE_REFERENCE:-}" | tr -d '[:space:]')"
+              DELIVER_TO_SSI="$(printf '%s' "${SSI_INSPECTION_DELIVER:-}" | tr '[:upper:]' '[:lower:]')"
+
+              # The reason is also written to the evidence folder, so the artifact step never
+              # fails with a second, misleading "Not found PathtoPublish" error.
+              fail() {
+                mkdir -p "${EVIDENCE_DIR}"
+                printf '%s\n' "$1" > "${EVIDENCE_DIR}/failure.txt"
+                echo "##vso[task.logissue type=error]$1"
+                exit 1
+              }
+              # A parameter value shown in a message: one line, at most 200 characters, no logging commands.
+              shown() { printf '%s' "$1" | head -c 200 | sed 's/##vso\[/##vso_[/g'; }
+
+              # --- Input validation (fail-closed, before any registry or Docker call) ---
+              reference_prefix="${HARBOR_HOST}/${HARBOR_PROJECT}/"
+              hint="Copy it with the copy button in Scan Results → Compare with another image in SSI."
+              [[ -n "${IMAGE_REFERENCE}" ]] || fail "imageReference is empty. ${hint}"
+              [[ "${IMAGE_REFERENCE}" == "${reference_prefix}"* ]] \
+                || fail "imageReference must start with ${reference_prefix} (received: $(shown "${IMAGE_REFERENCE}")). ${hint}"
+              [[ "${IMAGE_REFERENCE#"${reference_prefix}"}" =~ ^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[a-f0-9]{64}$ ]] \
+                || fail "imageReference must be repository@sha256:<64 hex>, without a tag (received: $(shown "${IMAGE_REFERENCE}")). ${hint}"
+              [[ "${DELIVER_TO_SSI}" == 'true' || "${DELIVER_TO_SSI}" == 'false' ]] || fail 'deliverToSsi must be true or false.'
+              command -v docker >/dev/null 2>&1 || fail 'Docker CLI is not available on this agent.'
+              command -v node >/dev/null 2>&1 || fail 'Node.js is not available on this agent.'
+              [[ -r "${TOOL}" ]] || fail 'scripts/image-inspection.mjs is missing from the SSI checkout.'
+              if [[ -z "${HARBOR_ROBOT_USERNAME:-}" || "${HARBOR_ROBOT_USERNAME}" == \$\(* \
+                 || -z "${HARBOR_ROBOT_SECRET:-}" || "${HARBOR_ROBOT_SECRET}" == \$\(* ]]; then
+                fail 'Pipeline variables HARBOR_ROBOT_USERNAME and HARBOR_ROBOT_SECRET (secret, pull-only robot) are required.'
+              fi
+
+              cleanup() {
+                docker rmi "${IMAGE_REFERENCE}" >/dev/null 2>&1 || true
+                docker --config "${WORK_DIR}/docker" logout "${HARBOR_HOST}" >/dev/null 2>&1 || true
+                rm -rf "${WORK_DIR}"
+              }
+              trap cleanup EXIT
+
+              mkdir -p "${WORK_DIR}/docker" "${WORK_DIR}/certs" "${WORK_DIR}/cache" "${EVIDENCE_DIR}"
+              chmod 700 "${WORK_DIR}" "${WORK_DIR}/docker"
+              export DOCKER_CONFIG="${WORK_DIR}/docker"
+
+              # Harbor CA for the Trivy container (same trust model as the other workers).
+              CA_FILE="${WORK_DIR}/certs/harbor-ca.pem"
+              if [[ "${SSI_INSPECTION_HARBOR_CA_CERT_PATH:-system}" == 'system' ]]; then
+                for candidate in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+                  if [[ -r "${candidate}" ]]; then cp "${candidate}" "${CA_FILE}"; break; fi
+                done
+              elif [[ -r "${SSI_INSPECTION_HARBOR_CA_CERT_PATH}" ]]; then
+                cp "${SSI_INSPECTION_HARBOR_CA_CERT_PATH}" "${CA_FILE}"
+              fi
+              [[ -s "${CA_FILE}" ]] || fail 'No readable CA bundle for Harbor TLS.'
+              chmod 644 "${CA_FILE}"
+
+              echo "Image: ${IMAGE_REFERENCE}"
+              printf '%s' "${HARBOR_ROBOT_SECRET}" | docker login "${HARBOR_HOST}" --username "${HARBOR_ROBOT_USERNAME}" --password-stdin >/dev/null \
+                || fail 'Harbor login failed. Check the robot account variables.'
+
+              docker pull --quiet "${IMAGE_REFERENCE}" >/dev/null
+              docker image inspect "${IMAGE_REFERENCE}" > "${WORK_DIR}/image.json"
+
+              # OS package inventory (Trivy license scanner: lists packages without downloading
+              # the vulnerability database).
+              docker run --rm \
+                --network host \
+                --add-host "${HARBOR_HOST}:${HARBOR_HOST_IP}" \
+                --user "$(id -u):$(id -g)" \
+                -e DOCKER_CONFIG=/work/docker \
+                -e TRIVY_CACHE_DIR=/work/cache \
+                -e SSL_CERT_FILE=/work/certs/harbor-ca.pem \
+                -v "${WORK_DIR}:/work" \
+                "${TRIVY_IMAGE}" image \
+                --image-src remote \
+                --scanners license \
+                --pkg-types os \
+                --format json \
+                --output /work/trivy.json \
+                --quiet \
+                --timeout 10m \
+                "${IMAGE_REFERENCE}"
+
+              node "${TOOL}" assemble \
+                --image-ref "${IMAGE_REFERENCE}" \
+                --image "${WORK_DIR}/image.json" \
+                --trivy "${WORK_DIR}/trivy.json" \
+                --pipeline "${BUILD_DEFINITIONNAME:-SSI - Image Inspection}" \
+                --build-id "${BUILD_BUILDID}" \
+                --agent "${AGENT_NAME:-unknown}" \
+                --out "${EVIDENCE_DIR}/image-inspection-result.json"
+              node "${TOOL}" summary --file "${EVIDENCE_DIR}/image-inspection-result.json" --out "${EVIDENCE_DIR}/summary.md"
+              echo "##vso[task.uploadsummary]${EVIDENCE_DIR}/summary.md"
+
+              if [[ "${DELIVER_TO_SSI}" == 'true' ]] && {
+                [[ -z "${SSI_IMAGE_INSPECTION_EVIDENCE_HMAC_SECRET:-}" || "${SSI_IMAGE_INSPECTION_EVIDENCE_HMAC_SECRET}" == \$\(* ]] \
+                  || [[ -z "${SSI_API_BASE_URL:-}" || "${SSI_API_BASE_URL}" == \$\(* ]]
+              }; then
+                echo '##vso[task.logissue type=warning]SSI_API_BASE_URL or the secret SSI_IMAGE_INSPECTION_EVIDENCE_HMAC_SECRET is not set; the result was not delivered to SSI.'
+                echo '##vso[task.complete result=SucceededWithIssues;]'
+              elif [[ "${DELIVER_TO_SSI}" == 'true' ]]; then
+                set +e
+                node "${TOOL}" deliver \
+                  --file "${EVIDENCE_DIR}/image-inspection-result.json" \
+                  --api-base-url "${SSI_API_BASE_URL:-}" \
+                  --allow-http "${SSI_API_ALLOW_HTTP:-false}" \
+                  --worker-id "${AGENT_NAME:-agent}:${AGENT_MACHINENAME:-unknown}"
+                delivery_status=$?
+                set -e
+                if [[ "${delivery_status}" -eq 2 ]]; then
+                  echo '##vso[task.logissue type=warning]SSI was unreachable; run this pipeline again for the same image.'
+                  echo '##vso[task.complete result=SucceededWithIssues;]'
+                elif [[ "${delivery_status}" -ne 0 ]]; then
+                  fail 'SSI rejected the image inspection result (see the message above).'
+                fi
+              else
+                echo '##vso[task.logissue type=warning]Delivery to SSI is off; the result is only in the run artifact.'
+              fi
+            displayName: 'Inspect image'
+            env:
+              SSI_INSPECTION_IMAGE_REFERENCE: ${{ parameters.imageReference }}
+              SSI_INSPECTION_HARBOR_CA_CERT_PATH: ${{ parameters.harborCaCertPath }}
+              SSI_INSPECTION_DELIVER: ${{ parameters.deliverToSsi }}
+              HARBOR_ROBOT_USERNAME: $(HARBOR_ROBOT_USERNAME)
+              HARBOR_ROBOT_SECRET: $(HARBOR_ROBOT_SECRET)
+              SSI_API_BASE_URL: $(SSI_API_BASE_URL)
+              SSI_API_ALLOW_HTTP: $(SSI_API_ALLOW_HTTP)
+              SSI_IMAGE_INSPECTION_EVIDENCE_HMAC_SECRET: $(SSI_IMAGE_INSPECTION_EVIDENCE_HMAC_SECRET)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish image inspection evidence'
+            condition: succeededOrFailed()
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)/image-inspection'
+              ArtifactName: 'image-inspection-evidence'
+              publishLocation: 'Container'
+
+          - script: |
+              rm -rf "${AGENT_TEMPDIRECTORY:?AGENT_TEMPDIRECTORY is required}/ssi-inspection-${BUILD_BUILDID:?BUILD_BUILDID is required}"
+              echo "Cleanup done: only this run's temporary files were removed."
+            displayName: 'Cleanup (only this run)'
+            condition: always()

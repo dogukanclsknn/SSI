@@ -1,0 +1,174 @@
+# Azure DevOps Pipeline - Quality Gate + Package
+#
+# Every push to main passes the quality gate before it is packaged; the Release that deploys
+# the package only runs on a green build. The gate:
+#   1. Secret scan of the committed files (gitleaks, pinned by version and checksum)
+#   2. Dependency audit (npm audit): runtime dependencies fail on high/critical,
+#      build-only dependencies fail on critical and warn on high
+#   3. Lint, unit tests and the production build
+#   4. End-to-end tests against a throwaway PostgreSQL container (removed afterwards)
+# The Package stage is unchanged: the Release consumes the same 'drop' artifact as before.
+trigger:
+  branches:
+    include:
+    - main
+
+pool: 'LinuxPool'
+
+# Values in this block are fixed for every run (a run cannot override them).
+variables:
+  # Secret scanner: version and the SHA-256 published in gitleaks_<version>_checksums.txt.
+  GITLEAKS_VERSION: '8.30.1'
+  GITLEAKS_LINUX_X64_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+  # Test database for the end-to-end run: postgres:16-alpine (the same major version as production,
+  # docker-compose.yml), pinned by digest so every run uses the same image. To update, take the
+  # digest logged as "Test database image:" by a run of the new tag.
+  E2E_POSTGRES_IMAGE: 'docker.io/library/postgres@sha256:81e77a4833487b8132fe4b00bedd39dc3f74b8641e387f19312a48f7de218c2e'
+
+stages:
+- stage: Quality
+  displayName: 'Lint / Test / Build'
+  jobs:
+  - job: Quality
+    timeoutInMinutes: 30
+    steps:
+    - task: UseNode@1
+      displayName: 'Use Node 22'
+      inputs:
+        version: '22.x'
+
+    # Scans exactly the committed files (git archive), before any dependency is installed.
+    # Findings are redacted in the log; a finding fails the build.
+    - script: |
+        set -euo pipefail
+        WORK="$(Agent.TempDirectory)/secret-scan"
+        rm -rf "${WORK}"
+        mkdir -p "${WORK}/bin" "${WORK}/tree"
+
+        if [[ ! "${GITLEAKS_LINUX_X64_SHA256}" =~ ^[a-f0-9]{64}$ ]]; then
+          echo 'No pinned SHA-256 for gitleaks; refusing to download.'
+          exit 2
+        fi
+        curl -sSfL --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 \
+          -o "${WORK}/gitleaks.tar.gz" \
+          "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+        if ! printf '%s  %s\n' "${GITLEAKS_LINUX_X64_SHA256}" "${WORK}/gitleaks.tar.gz" | sha256sum --check --status; then
+          echo 'gitleaks checksum mismatch: the download was deleted and is not used.'
+          rm -f "${WORK}/gitleaks.tar.gz"
+          exit 3
+        fi
+        tar -xzf "${WORK}/gitleaks.tar.gz" -C "${WORK}/bin" gitleaks
+
+        git archive HEAD | tar -x -C "${WORK}/tree"
+        set +e
+        "${WORK}/bin/gitleaks" dir "${WORK}/tree" --redact --no-banner --verbose --exit-code 1
+        status=$?
+        set -e
+        rm -rf "${WORK}"
+        if [[ "${status}" -ne 0 ]]; then
+          echo '##vso[task.logissue type=error]Secret scan found possible credentials in the committed files (values redacted above). Remove them and rotate any real secret.'
+          exit "${status}"
+        fi
+        echo 'Secret scan: no findings.'
+      displayName: 'Secret scan (gitleaks)'
+      env:
+        GITLEAKS_VERSION: $(GITLEAKS_VERSION)
+        GITLEAKS_LINUX_X64_SHA256: $(GITLEAKS_LINUX_X64_SHA256)
+
+    - script: npm ci
+      displayName: 'Install dependencies'
+
+    # Runtime dependencies ship in the production image: high or critical fails the build.
+    # Build-only dependencies never reach production: critical fails, high is reported.
+    - script: |
+        set -uo pipefail
+        echo '--- Runtime dependencies (npm audit --omit=dev --audit-level=high)'
+        if ! npm audit --omit=dev --audit-level=high; then
+          echo '##vso[task.logissue type=error]A runtime dependency has a high or critical vulnerability, or the audit could not reach the npm registry (see above). Update the dependency (npm audit fix) before merging.'
+          exit 1
+        fi
+        echo '--- All dependencies (npm audit --audit-level=critical)'
+        if ! npm audit --audit-level=critical; then
+          echo '##vso[task.logissue type=error]A build dependency has a critical vulnerability, or the audit could not reach the npm registry (see above). Update the dependency (npm audit fix) before merging.'
+          exit 1
+        fi
+        if ! npm audit --audit-level=high >/dev/null 2>&1; then
+          echo '##vso[task.logissue type=warning]A build-only dependency has a high vulnerability; run npm audit fix soon.'
+        fi
+        echo 'Dependency audit passed.'
+      displayName: 'Dependency audit (npm audit)'
+
+    - script: npm run lint
+      displayName: 'Lint (ESLint)'
+    - script: npm run test
+      displayName: 'Unit tests (Vitest)'
+    - script: npm run build
+      displayName: 'Production build'
+
+    # The tenancy end-to-end suite (scripts/e2e/tenancy-e2e.mjs) against an empty PostgreSQL in
+    # a throwaway container: published on 127.0.0.1 only, on a free port, removed afterwards.
+    - script: |
+        set -euo pipefail
+        NAME="ssi-ci-e2e-pg-$(Build.BuildId)-$(System.JobAttempt)"
+        echo "##vso[task.setvariable variable=E2E_POSTGRES_CONTAINER]${NAME}"
+        PASSWORD="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+
+        docker run -d --rm --name "${NAME}" \
+          -e POSTGRES_USER=ssi -e POSTGRES_DB=ssi_e2e -e POSTGRES_PASSWORD="${PASSWORD}" \
+          -p 127.0.0.1::5432 \
+          "${E2E_POSTGRES_IMAGE}" >/dev/null
+        echo "Test database image: $(docker image inspect --format '{{index .RepoDigests 0}}' "${E2E_POSTGRES_IMAGE}")"
+
+        # Ready only once the final server accepts TCP (the image's init server is socket-only).
+        for attempt in $(seq 1 60); do
+          if docker exec "${NAME}" pg_isready -h 127.0.0.1 -p 5432 -U ssi -d ssi_e2e >/dev/null 2>&1; then break; fi
+          if [[ "${attempt}" -eq 60 ]]; then echo 'The test database did not become ready.'; docker logs "${NAME}" | tail -20; exit 1; fi
+          sleep 1
+        done
+        DB_PORT="$(docker port "${NAME}" 5432/tcp | head -1 | sed 's/.*://')"
+
+        # Two free local ports for SSI and the fake Harbor of the suite.
+        read -r SSI_PORT HARBOR_PORT < <(node -e '
+          const net = require("net");
+          const free = () => new Promise((resolve) => { const s = net.createServer().listen(0, "127.0.0.1", () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
+          Promise.all([free(), free()]).then((ports) => console.log(ports.join(" ")));
+        ')
+
+        DATABASE_URL="postgres://ssi:${PASSWORD}@127.0.0.1:${DB_PORT}/ssi_e2e" \
+        DATABASE_SSL_MODE=disable \
+        E2E_SSI_PORT="${SSI_PORT}" E2E_HARBOR_PORT="${HARBOR_PORT}" \
+          npm run -s test:e2e:tenancy
+      displayName: 'End-to-end tests (PostgreSQL)'
+      timeoutInMinutes: 10
+      env:
+        E2E_POSTGRES_IMAGE: $(E2E_POSTGRES_IMAGE)
+
+    - script: |
+        if [[ -n "${E2E_POSTGRES_CONTAINER:-}" ]]; then
+          docker rm -f "${E2E_POSTGRES_CONTAINER}" >/dev/null 2>&1 || true
+          echo "Removed ${E2E_POSTGRES_CONTAINER}."
+        fi
+      displayName: 'Remove the test database'
+      condition: always()
+
+- stage: Package
+  displayName: 'Package Files'
+  dependsOn: Quality
+  condition: succeeded()
+  jobs:
+  - job: Package
+    steps:
+    - task: ArchiveFiles@2
+      displayName: 'Archive Application Files'
+      inputs:
+        rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/app.zip'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifacts'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'

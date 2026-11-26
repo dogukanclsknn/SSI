@@ -1,0 +1,2471 @@
+openapi: 3.0.3
+info:
+  title: SSI — Container Vulnerability Remediation Platform API
+  version: 0.2.0
+  description: >
+    SSI REST/JSON API sözleşmesi. Faz 4 kapsamında Harbor inventory, Trivy scan,
+    OS-package Dry Run, canonical report, Copacetic verification evidence,
+    remediation reporting ve yapılandırılmış audit akışları uygulanmıştır. Job,
+    evidence ve audit kayıtları memory veya migration kontrollü PostgreSQL store
+    üzerinden çalışır. Bearer şeması Faz 5 LDAP/AD + RBAC entegrasyonu için
+    placeholder'dır; mevcut PoC runtime authentication uygulamadığı için global
+    security requirement etkin değildir.
+
+servers:
+  - url: https://ssi.company.local/api/v1
+    description: Kurum içi (planlanan)
+  - url: http://localhost:5021/api/v1
+    description: Lokal Node API
+
+security: []
+
+tags:
+  - name: Health
+  - name: Inventory
+  - name: Ingest
+  - name: Scan
+  - name: Remediation
+  - name: Publish
+  - name: Policy
+  - name: Exceptions
+  - name: Reports
+  - name: Audit
+  - name: Jobs
+  - name: Teams
+  - name: Integrations
+    description: >-
+      Multi-tenancy (src/lib/tenancy.js). While `SSI_MULTI_TENANCY=false` (default) every
+      record is in the `default` team and the global role applies; the `X-SSI-Tenant`
+      header is ignored. When it is on, every team-owned record (remediation jobs, publish
+      requests, onboarding requests, risk acceptances, their audit events) is read and
+      written only inside the caller's team; the caller's role in that team replaces the
+      global role. Platform administrators (`users.role = admin`) act in every team. A
+      member of several teams selects one with `X-SSI-Tenant` (400 without it); an unknown
+      team and a team the caller is not in both answer 403 with the same message.
+      Worker callbacks (token/HMAC) act in the team of the record they name; their work
+      orders (handoffs) then carry `tenantId`.
+      Harbor images belong to the team whose folder holds them (longest match; default
+      folders `onboarded/<team>/` and `approved/<team>/` in the shared project, today's
+      `onboarded/` and `approved/` for the `default` team). Inventory and scans are
+      team-scoped, except published (approved) images, which every team sees as a shared
+      catalog labelled with `tenantId`/`tenantName`. Onboarding lands in the team's onboard
+      folder and the publish policy's registry boundary is the team's approved folder.
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: API ve persistence sağlık durumu
+      security: []
+      responses:
+        '200':
+          description: API ve seçili persistence sürücüsü sağlıklı
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+        '503':
+          description: Persistence bağlantısı sağlıksız
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /images:
+    get:
+      tags: [Inventory]
+      summary: Envanterdeki imajları listele
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Arama (isim/tag/runtime) }
+        - { name: type, in: query, schema: { $ref: '#/components/schemas/ImageType' } }
+        - { name: source, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: İmaj listesi
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Image' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /images/{imageId}:
+    get:
+      tags: [Inventory]
+      summary: İmaj detayı
+      parameters: [ { $ref: '#/components/parameters/ImageId' } ]
+      responses:
+        '200':
+          description: İmaj
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Image' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /images/{imageId}/sbom:
+    get:
+      tags: [Inventory]
+      summary: İmajın SBOM bileşenleri
+      parameters: [ { $ref: '#/components/parameters/ImageId' } ]
+      responses:
+        '200':
+          description: SBOM (SPDX/CycloneDX'ten türetilmiş bileşen listesi)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SbomComponent' }
+
+  /scans:
+    get:
+      tags: [Scan]
+      summary: Scan Results ekranı için normalize edilmiş tarama raporlarını listele
+      responses:
+        '200':
+          description: Normalize edilmiş Harbor/Trivy scan raporları. Harbor bağlantısı aktifken gerçek artifact sonucu okunur; boş, pending ve hata durumları X-SSI-Data-Source/X-SSI-Data-Error headerları ile belirtilir.
+          headers:
+            X-SSI-Data-Source:
+              schema: { type: string, enum: [harbor, harbor-partial, harbor-empty, harbor-scan-pending, harbor-scan-error, trivy-fixture, fixture] }
+              description: Raporların kaynağı ve Harbor scan durumu.
+            X-SSI-Data-Error:
+              schema: { type: string }
+              description: Harbor boş/pending/hata durumunda kullanıcıya gösterilebilecek açıklama.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScanReport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /scans/compare:
+    get:
+      tags: [Scan]
+      summary: Taranmış iki imajı zafiyet bazında karşılaştır (Scan Results → "Compare with another image")
+      description: >-
+        Salt okunurdur; Harbor'a yazmaz, tarama başlatmaz. İki imajın bugünkü Harbor taramaları
+        CVE + paket bazında karşılaştırılır: "new" yalnızca karşılaştırılan imajda, "fixed" yalnızca
+        base imajda, "remaining" ikisinde de. İmajlar tag ile değil immutable referansla seçilir;
+        tag sonradan başka imaja taşınsa bile yanlış imaj karşılaştırılmaz. Yalnızca çağıranın
+        GET /scans ile görebildiği taramalar kullanılabilir (ekip ayrımı açıksa kendi ekibininkiler).
+        Tarama tarihleri 7 günden fazla ayrıysa "scans-apart" bilgi notu döner.
+      parameters:
+        - name: base
+          in: query
+          required: true
+          description: Base imaj, <project>/<repository>@sha256:<64 hex>
+          schema: { type: string, example: 'ssi-images/onboarded/nginx@sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606' }
+        - name: head
+          in: query
+          required: true
+          description: Karşılaştırılan imaj, aynı biçimde
+          schema: { type: string }
+      responses:
+        '200':
+          description: Karşılaştırma (ssi.image-comparison/v1, kind = images)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImageComparison' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: Referanslardan birinin görünür ve güncel bir taraması yok
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Referans biçimi hatalı ya da iki referans aynı içerik (aynı digest)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /images/{imageId}/scan:
+    get:
+      tags: [Scan]
+      summary: İmajın son tarama raporu
+      parameters: [ { $ref: '#/components/parameters/ImageId' } ]
+      responses:
+        '200':
+          description: Tarama raporu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanReport' }
+    post:
+      tags: [Scan]
+      summary: Yeni tarama tetikle (async)
+      parameters: [ { $ref: '#/components/parameters/ImageId' } ]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                scanner: { $ref: '#/components/schemas/Scanner' }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+
+  /images/{imageId}/remediation:
+    post:
+      tags: [Remediation]
+      summary: Dry Run OS package remediation planı oluşturur (gerçek Copa execution çalıştırmaz)
+      parameters: [ { $ref: '#/components/parameters/ImageId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DryRunRemediationRequest' }
+      responses:
+        '201':
+          description: Dry Run remediation planı oluşturuldu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationJob' }
+        '404':
+          description: Scan report bulunamadı veya remediation planı için hazır değil
+        '415':
+          description: Content-Type application/json olmalı
+        '422':
+          description: Bu fazda yalnızca dryRun=true kabul edilir
+
+  /images/{imageId}/publish:
+    post:
+      tags: [Publish]
+      summary: Doğrulanmış imajı Harbor'a robot account ile yayınla (async)
+      parameters: [ { $ref: '#/components/parameters/ImageId' } ]
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+        '409':
+          description: Policy gate reddetti (Critical/High CVE veya imza/SBOM eksik)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyResult' }
+
+  /ingest:
+    get:
+      tags: [Ingest]
+      summary: Ingest kuyruğu
+      responses:
+        '200':
+          description: Ingest işleri
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/IngestJob' }
+    post:
+      tags: [Ingest]
+      summary: Registry'den imaj al ve taramayı başlat (async)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image, source]
+              properties:
+                image: { type: string, example: docker.io/library/nginx:1.27 }
+                source: { type: string, enum: [Docker Hub, Private Registry, Harbor] }
+                scanner: { $ref: '#/components/schemas/Scanner' }
+      responses:
+        '202': { $ref: '#/components/responses/JobAccepted' }
+
+  /remediation:
+    get:
+      tags: [Remediation]
+      summary: Remediation jobları (sonuç/geçmiş)
+      responses:
+        '200':
+          description: Remediation job listesi
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RemediationJob' }
+
+  /remediation/{jobId}:
+    get:
+      tags: [Remediation]
+      summary: Remediation sonucu (before/after doğrulama)
+      parameters: [ { name: jobId, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200':
+          description: Remediation sonucu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationJob' }
+
+  /remediation/{jobId}/canonical-report:
+    post:
+      tags: [Remediation]
+      summary: Immutable source digest ile eşleşen OS-only canonical Trivy raporunu kabul eder
+      description: >-
+        Raw Trivy JSON en fazla 2 MiB kabul edilir. Rapor SchemaVersion 2, container image
+        artifact türü, job'ın immutable source digest'i ve yalnızca os-pkgs sonuçlarıyla
+        doğrulanır. Receipt contentDigest değeri, yüklenen UTF-8 JSON dosyasının ham
+        içeriğinden hesaplanır ve pipeline artifact digest'iyle aynı byte kimliğini korur.
+        Başarılı intake Dry Run planını yeniden hesaplar; worker dispatch, image pull,
+        Copa patch, registry push veya re-scan başlatmaz.
+      parameters: [ { name: jobId, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CanonicalTrivyReport' }
+      responses:
+        '200':
+          description: Canonical rapor doğrulandı ve Dry Run planı yeniden hesaplandı
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationJob' }
+        '404':
+          description: Remediation job bulunamadı
+        '413':
+          description: Canonical JSON 2 MiB sınırını aştı
+        '415':
+          description: Content-Type application/json olmalı
+        '422':
+          description: Rapor şeması, scope'u veya source digest'i kabul edilmedi
+
+  /remediation/{jobId}/verification-evidence:
+    post:
+      tags: [Remediation]
+      summary: Onaylı Copa execution evidence'ını doğrular ve ayrı bir Verified job oluşturur
+      description: >-
+        JSON evidence en fazla 2 MiB kabul edilir. Contract sürümü, immutable source ve
+        output digestleri, canonical Trivy content digest'i, Copacetic sürümü, OS-only
+        before/after sayıları ve fixed/remaining muhasebesi Dry Run job'ıyla birebir
+        doğrulanır. Endpoint merkezi publish başlatmaz. Aynı output digest ve aynı evidence
+        tekrar gönderilirse mevcut kayıt idempotent olarak döner.
+      parameters: [ { name: jobId, in: path, required: true, schema: { type: string } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RemediationVerificationEvidence' }
+      responses:
+        '200':
+          description: Aynı evidence daha önce kabul edildi; mevcut Verified job döndürüldü
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationJob' }
+        '201':
+          description: Evidence doğrulandı ve ayrı Verified execution job oluşturuldu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationJob' }
+        '404':
+          description: Parent Dry Run remediation job bulunamadı
+        '409':
+          description: Aynı output digest için farklı evidence daha önce kaydedildi
+        '413':
+          description: Evidence JSON 2 MiB sınırını aştı
+        '415':
+          description: Content-Type application/json olmalı
+        '422':
+          description: Evidence kontratı veya immutable doğrulama koşulları sağlanmadı
+
+  /remediation/{jobId}/worker-evidence:
+    post:
+      tags: [Remediation]
+      operationId: acceptSignedRemediationWorkerEvidence
+      summary: Remediation worker evidence'ını HMAC imzasıyla doğrular ve Verified job oluşturur
+      description: >-
+        Copa worker'ın ürettiği exact JSON body en fazla 2 MiB kabul edilir. İmza;
+        contract sürümü, epoch timestamp, jobId, worker kimliği ve body SHA-256 digest'ini
+        HMAC-SHA256 ile bağlar. Varsayılan replay penceresi 300 saniyedir. Başarılı
+        doğrulama sonrasında verification-evidence ile aynı immutable/scope kontrolleri
+        uygulanır. Endpoint merkezi publish başlatmaz. Aynı output digest ve aynı evidence
+        tekrar gönderilirse mevcut kayıt idempotent olarak döner.
+      security:
+        - workerEvidenceHmac: []
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+        - { name: X-SSI-Evidence-Version, in: header, required: true, schema: { type: string, enum: [v1] } }
+        - { name: X-SSI-Evidence-Timestamp, in: header, required: true, schema: { type: integer, format: int64 } }
+        - { name: X-SSI-Evidence-Content-SHA256, in: header, required: true, schema: { type: string, pattern: '^sha256:[a-f0-9]{64}$' } }
+        - { name: X-SSI-Evidence-Worker-ID, in: header, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RemediationVerificationEvidence' }
+      responses:
+        '200':
+          description: Aynı imzalı evidence daha önce kabul edildi; mevcut Verified job döndürüldü
+          headers:
+            X-SSI-Evidence-Replay: { schema: { type: string, enum: ['true'] } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationJob' }
+        '201':
+          description: İmza ve evidence doğrulandı; ayrı Verified execution job oluşturuldu
+          headers:
+            X-SSI-Evidence-Replay: { schema: { type: string, enum: ['false'] } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationJob' }
+        '400':
+          description: Evidence gövdesi geçerli bir JSON object değil
+        '401':
+          description: İmza, content digest, worker kimliği veya replay penceresi doğrulanamadı
+        '404':
+          description: Parent Dry Run remediation job bulunamadı
+        '409':
+          description: Aynı output digest için farklı evidence daha önce kaydedildi
+        '413':
+          description: Evidence JSON 2 MiB sınırını aştı
+        '415':
+          description: Content-Type application/json olmalı
+        '422':
+          description: Evidence kontratı veya immutable doğrulama koşulları sağlanmadı
+        '503':
+          description: Server worker-evidence signing secret'i güvenli biçimde yapılandırılmadı
+
+  /remediation/{jobId}/supply-chain-evidence:
+    post:
+      tags: [Remediation]
+      operationId: uploadSupplyChainEvidence
+      summary: Manual upload of the signing worker's supply-chain receipt (signature, SBOM, provenance)
+      description: >-
+        Requires `remediation:manage`. The receipt must be bound to the RM-EXEC job's
+        immutable output digest. Stored with `supplyChain.intake = {channel: manual, actor}`
+        and audited as `remediation.supply-chain-evidence.accepted`.
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Evidence validated and attached; the updated job is returned }
+        '401': { description: Not signed in }
+        '403': { description: Missing remediation:manage }
+        '404': { description: Remediation job not found }
+        '422': { description: Receipt contract or digest binding is invalid }
+
+  /remediation/{jobId}/worker-supply-chain-evidence:
+    post:
+      tags: [Remediation]
+      operationId: acceptSignedSupplyChainEvidence
+      summary: Signing-worker delivery of the supply-chain receipt, authenticated with HMAC-SHA256
+      description: >-
+        Same headers as worker-evidence, but the signed payload's first line is
+        `ssi-supply-chain-evidence-v1` (domain separation: a remediation-evidence signature
+        is never accepted here). Secret: `SSI_SUPPLY_CHAIN_EVIDENCE_HMAC_SECRET` (≥ 32 bytes).
+        Stored with `supplyChain.intake = {channel: worker, workerId}`.
+      security:
+        - workerEvidenceHmac: []
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+        - { name: X-SSI-Evidence-Version, in: header, required: true, schema: { type: string, enum: [v1] } }
+        - { name: X-SSI-Evidence-Timestamp, in: header, required: true, schema: { type: integer, format: int64 } }
+        - { name: X-SSI-Evidence-Content-SHA256, in: header, required: true, schema: { type: string, pattern: '^sha256:[a-f0-9]{64}$' } }
+        - { name: X-SSI-Evidence-Worker-ID, in: header, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200': { description: Signature and receipt validated; evidence attached }
+        '401': { description: Signature, digest, worker id or replay window could not be verified }
+        '404': { description: Remediation job not found }
+        '422': { description: Receipt contract or digest binding is invalid }
+        '503': { description: The supply-chain signing secret is not configured securely }
+
+  /remediation/{jobId}/candidate-test:
+    post:
+      tags: [Remediation]
+      operationId: uploadCandidateTestResult
+      summary: Manual upload of the candidate test worker's result (pre-release testing, step 1)
+      description: >-
+        Requires `remediation:manage`. The ssi.candidate-test/v1 result must be bound to the
+        RM-EXEC job: candidate digest = verified output digest, source digest = job source
+        digest. SSI re-derives the verdict from the checks and marks package changes outside
+        the remediation plan. An identical body is an idempotent replay
+        (`X-SSI-Evidence-Replay: true`); an older result never replaces a newer one (409).
+        Audited as `remediation.candidate-test.accepted` / `.rejected`.
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CandidateTestEvidence' }
+      responses:
+        '200': { description: Result validated and attached (passed or failed); the updated job is returned }
+        '401': { description: Not signed in }
+        '403': { description: Missing remediation:manage }
+        '404': { description: Remediation job not found }
+        '409': { description: The job is not a verified RM-EXEC job, or a newer result is already recorded }
+        '413': { description: Body larger than 1 MiB }
+        '422': { description: Contract, digest binding or check consistency is invalid }
+
+  /remediation/{jobId}/worker-candidate-test:
+    post:
+      tags: [Remediation]
+      operationId: acceptSignedCandidateTestResult
+      summary: Candidate test worker delivery, authenticated with HMAC-SHA256
+      description: >-
+        Same headers as worker-evidence; the signed payload's first line is
+        `ssi-candidate-test-evidence-v1` (domain separation). Secret:
+        `SSI_CANDIDATE_TEST_EVIDENCE_HMAC_SECRET` (at least 32 bytes). Validation and replay
+        rules as for the manual upload; stored with `candidateTest.intake = {channel: worker, workerId}`.
+      security:
+        - workerEvidenceHmac: []
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+        - { name: X-SSI-Evidence-Version, in: header, required: true, schema: { type: string, enum: [v1] } }
+        - { name: X-SSI-Evidence-Timestamp, in: header, required: true, schema: { type: integer, format: int64 } }
+        - { name: X-SSI-Evidence-Content-SHA256, in: header, required: true, schema: { type: string, pattern: '^sha256:[a-f0-9]{64}$' } }
+        - { name: X-SSI-Evidence-Worker-ID, in: header, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CandidateTestEvidence' }
+      responses:
+        '200': { description: Signature and result validated; result attached }
+        '401': { description: Signature, digest, worker id or replay window could not be verified }
+        '404': { description: Remediation job not found }
+        '409': { description: The job is not a verified RM-EXEC job, or a newer result is already recorded }
+        '422': { description: Contract, digest binding or check consistency is invalid }
+        '503': { description: The candidate test signing secret is not configured securely }
+
+  /remediation/{jobId}/worker-canonical-report:
+    post:
+      tags: [Remediation]
+      operationId: acceptSignedCanonicalReport
+      summary: Canonical scan worker delivery of canonical-trivy.json, authenticated with HMAC-SHA256
+      description: >-
+        The exact bytes of the canonical OS-only Trivy JSON the SSI - Canonical Trivy Scan run
+        published, for a Dry Run job. Same headers as worker-evidence; the signed payload's
+        first line is `ssi-canonical-report-v1` (domain separation). Secret:
+        `SSI_CANONICAL_REPORT_HMAC_SECRET` (at least 32 bytes). Validation as for the manual
+        upload (POST /remediation/{jobId}/canonical-report); the content digest is computed from
+        these bytes. Stored with `canonicalReport.intake = {channel: worker, workerId}`. The same
+        report again changes nothing and answers `X-SSI-Evidence-Replay: true`.
+      security:
+        - workerEvidenceHmac: []
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+        - { name: X-SSI-Evidence-Version, in: header, required: true, schema: { type: string, enum: [v1] } }
+        - { name: X-SSI-Evidence-Timestamp, in: header, required: true, schema: { type: integer, format: int64 } }
+        - { name: X-SSI-Evidence-Content-SHA256, in: header, required: true, schema: { type: string, pattern: '^sha256:[a-f0-9]{64}$' } }
+        - { name: X-SSI-Evidence-Worker-ID, in: header, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: Trivy JSON report (SchemaVersion 2, os-pkgs results only) }
+      responses:
+        '200': { description: Report accepted and the Dry Run re-planned (or an unchanged replay) }
+        '401': { description: Signature, digest, worker id or replay window could not be verified }
+        '404': { description: Remediation job not found }
+        '409': { description: The job is not a Dry Run }
+        '413': { description: Body larger than 2 MiB }
+        '422': { description: Not a canonical OS-only report, or its source digest does not match the job }
+        '503': { description: The canonical report signing secret is not configured securely }
+
+  /image-inspections/{digest}/worker:
+    post:
+      tags: [Scan]
+      operationId: acceptSignedImageInspection
+      summary: Image inspection worker delivery (SSI - Image Inspection), authenticated with HMAC-SHA256
+      description: >-
+        One scanned image's OS package inventory, layers, size and runtime configuration
+        (Env names only) for the free comparison (GET /scans/compare). Same headers as the other
+        worker routes; the signed payload's first line is `ssi-image-inspection-evidence-v1` and
+        its subject is the image digest of the path. Secret: `SSI_IMAGE_INSPECTION_EVIDENCE_HMAC_SECRET`
+        (at least 32 bytes). The image must be in the SSI Harbor (ONBOARD_TARGET_REGISTRY,
+        PUBLISH_TARGET_REGISTRY or the HARBOR_URL host; a HARBOR_PROJECTS project) and scanned by
+        Harbor. A replay of the same body is idempotent (`X-SSI-Evidence-Replay: true`); an older
+        result never replaces a newer one. Every accepted or refused result is audited.
+      security:
+        - workerEvidenceHmac: []
+      parameters:
+        - { name: digest, in: path, required: true, schema: { type: string, pattern: '^sha256:[a-f0-9]{64}$' } }
+        - { name: X-SSI-Evidence-Version, in: header, required: true, schema: { type: string, enum: [v1] } }
+        - { name: X-SSI-Evidence-Timestamp, in: header, required: true, schema: { type: integer, format: int64 } }
+        - { name: X-SSI-Evidence-Content-SHA256, in: header, required: true, schema: { type: string, pattern: '^sha256:[a-f0-9]{64}$' } }
+        - { name: X-SSI-Evidence-Worker-ID, in: header, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImageInspectionEvidence' }
+      responses:
+        '200':
+          description: Validated and stored (or an idempotent replay)
+          headers:
+            X-SSI-Evidence-Replay: { schema: { type: string, enum: ['true', 'false'] } }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reference: { type: string, example: 'ssi-images/onboarded/nginx@sha256:…' }
+                  digest: { type: string }
+                  generatedAt: { type: string, format: date-time }
+                  os: { type: string }
+                  platform: { type: string }
+                  packages: { type: integer }
+                  layers: { type: integer }
+        '401': { description: Signature, digest, worker id or replay window could not be verified }
+        '409': { description: Harbor has no current scan of the image, or a newer inspection is already recorded }
+        '422': { description: Contract, registry/project binding, package list or Env names are invalid }
+        '503': { description: The image inspection signing secret is not configured securely }
+
+  /remediation/{jobId}/consumer-acceptance:
+    post:
+      tags: [Remediation]
+      operationId: recordConsumerAcceptance
+      summary: A consumer team records that it tried the candidate (pre-release testing, step 2)
+      description: >-
+        Requires `remediation:accept` (operator or approver). `accepted` needs a passed
+        candidate test for the same digest; `issue-found` is always allowed and blocks
+        publish. The decider is the trusted session identity. Decisions are kept as history.
+        Audited as `remediation.consumer-acceptance.accepted` / `.issue-reported`.
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, environment]
+              additionalProperties: false
+              properties:
+                decision: { type: string, enum: [accepted, issue-found] }
+                environment: { type: string, minLength: 3, maxLength: 120, description: Project or environment where the image was tried }
+                note: { type: string, maxLength: 1000, description: 'Required (at least 10 characters) for issue-found' }
+      responses:
+        '200': { description: Decision recorded; the updated job is returned }
+        '401': { description: Not signed in }
+        '403': { description: Missing remediation:accept, or no trusted identity }
+        '404': { description: Remediation job not found }
+        '409': { description: Not a verified RM-EXEC job, or the automatic test has not passed }
+        '422': { description: Invalid decision, environment or note }
+
+  /remediation/{jobId}/execution-readiness:
+    get:
+      tags: [Remediation]
+      summary: Izole worker dispatch öncesi remediation execution readiness bilgisini döner
+      description: Salt-okunur kontrattır; worker dispatch, image pull, Copa patch, registry push veya re-scan başlatmaz.
+      parameters: [ { name: jobId, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200':
+          description: Worker lifecycle ve önkoşul durumu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationExecutionReadiness' }
+        '404':
+          description: Remediation job bulunamadı
+
+  /remediation/{jobId}/comparison:
+    get:
+      tags: [Remediation]
+      summary: Kaynak imaj ile yamalı imajın karşılaştırması ("What changed")
+      description: >-
+        Salt-okunurdur; Harbor'a yazmaz, tarama başlatmaz. Yalnızca doğrulanmış execution job'ları
+        için üretilir. Her boyut (dimension) kendi kanıt kaynağını, durumunu ve satırlarını taşır;
+        yeni bir boyut sözleşmeyi bozmadan eklenir. "At verification" boyutu donmuş remediation
+        kanıtından, "today" boyutu iki digest'in Harbor'daki güncel taramasından gelir. Ortam
+        değişkenleri yalnızca isim olarak karşılaştırılır; değerleri toplanmaz.
+      parameters: [ { name: jobId, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200':
+          description: Karşılaştırma (ssi.image-comparison/v1)
+          headers:
+            X-SSI-Data-Error:
+              description: Harbor okunamadıysa nedeni; "today" boyutu bu durumda unavailable döner
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImageComparison' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Job doğrulanmış bir execution job değil ya da kaynak/yamalı digest eksik
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /remediation/{jobId}/worker-handoff:
+    get:
+      tags: [Remediation]
+      summary: Canonical Dry Run için credential-free prepare-only worker handoff manifesti döner
+      description: >-
+        Salt-okunur kontrattır. Yalnızca immutable source digest, doğrulanmış OS-only canonical
+        Trivy receipt ve planlanabilir package fixleri bulunan planned Dry Run için oluşturulur.
+        Worker dispatch, image pull, Copa patch, registry push veya re-scan başlatmaz; raw Trivy
+        JSON ve registry credential'i içermez.
+      parameters: [ { name: jobId, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200':
+          description: Credential-free worker handoff manifesti
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationHandoffManifest' }
+        '404':
+          description: Remediation job bulunamadı
+        '409':
+          description: Canonical plan veya handoff önkoşulları sağlanmadı
+
+  /publish:
+    get:
+      tags: [Publish]
+      summary: Yayın kuyruğu / geçmişi
+      responses:
+        '200':
+          description: Publish öğeleri
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PublishItem' }
+
+  /publish-requests/{requestId}/reject:
+    post:
+      tags: [Publish]
+      operationId: rejectPublishRequest
+      summary: An approver rejects a publish request that waits for approval
+      description: >-
+        Requires `publish:approve` (approver or admin) and a trusted identity. Only an
+        `ApprovalRequired` request can be rejected; an `Approved` request is not rejectable
+        because the isolated worker may already be writing to the registry (its job-bound
+        checks are re-evaluated at the worker handoff instead). `Rejected` is final.
+        Audited as `publish.request.rejected`.
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string, pattern: '^PUB-[0-9]{4,}$' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 10, maxLength: 1000, description: Single line of printable text }
+      responses:
+        '200': { description: The rejected publish request (status Rejected, rejection record) }
+        '401': { description: Not signed in }
+        '403': { description: Missing publish:approve, or no trusted identity }
+        '404': { description: Publish request not found }
+        '409': { description: The request is not waiting for approval, or it changed meanwhile }
+        '422': { description: Invalid reason }
+
+  /publish-requests/{requestId}/withdraw:
+    post:
+      tags: [Publish]
+      operationId: withdrawPublishedImage
+      summary: An approver withdraws a published image
+      description: >-
+        Requires `publish:approve` (approver or admin) and a trusted identity; one authorized
+        person decides. The image (digest) is withdrawn, not one tag: every `Published`
+        request for the same digest becomes `Withdrawn`, and the remediation job that produced
+        the digest records `publishWithdrawal`. Every still-open request for the digest
+        (`Blocked`, `ApprovalRequired`, `Approved`) becomes `Cancelled` (`cancellation.cause:
+        image-withdrawn`, with `previousStatus`). All of it is written in one transaction.
+        From then on the publish policy check `image-not-withdrawn` blocks every new or
+        pending request for the digest, and no candidate test result or consumer decision is
+        accepted for it. A publish receipt that arrives later (worker already had its handoff)
+        is recorded but stored as `Withdrawn` (`withdrawal.publishedAfterWithdrawal`); this also
+        applies to a request cancelled while `Approved`. A receipt for a request cancelled
+        before approval is refused (409). SSI does not remove the image from the registry.
+        `Withdrawn` and `Cancelled` are final.
+        Audited as `publish.withdrawn` (per request), `publish.request.cancelled` (per
+        cancelled request) and `remediation.output.withdrawn`.
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string, pattern: '^PUB-[0-9]{4,}$' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason, category]
+              properties:
+                reason: { type: string, minLength: 10, maxLength: 1000, description: Single line of printable text }
+                category: { type: string, enum: [functional, security, compliance, other] }
+      responses:
+        '200': { description: 'The withdrawn publish request (status Withdrawn, withdrawal record); cancelled requests are in the audit log' }
+        '401': { description: Not signed in }
+        '403': { description: Missing publish:approve, or no trusted identity }
+        '404': { description: Publish request not found }
+        '409': { description: The request is not Published, its digest does not match its job, or a request changed meanwhile }
+        '422': { description: Invalid reason or category }
+
+  /policy/rules:
+    get:
+      tags: [Policy]
+      summary: Enforcement kuralları
+      responses:
+        '200':
+          description: Politika kuralları
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PolicyRule' }
+
+  /policy/evaluate:
+    post:
+      tags: [Policy]
+      summary: Bir imajı admission politikasına göre değerlendir
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [imageId]
+              properties:
+                imageId: { type: string }
+      responses:
+        '200':
+          description: Değerlendirme sonucu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyResult' }
+
+  /remediation/{jobId}/pipeline-runs:
+    parameters:
+      - { name: jobId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Integrations]
+      summary: İşin Azure DevOps worker pipeline aksiyonları ve run'ları (canlı durum)
+      responses:
+        '200':
+          description: Aksiyonlar ve run'lar. Otomasyon kapalıysa enabled=false.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  actions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        action: { type: string, enum: [canonical-scan, copa-prepare, copa-execute, candidate-test] }
+                        role: { type: string }
+                        label: { type: string }
+                        available: { type: boolean }
+                        reason: { type: string }
+                        needsBuildId: { type: boolean }
+                  runs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        action: { type: string }
+                        pipelineId: { type: integer }
+                        runId: { type: integer }
+                        runName: { type: string }
+                        state: { type: string, enum: [unknown, inProgress, canceling, completed] }
+                        result: { type: string, nullable: true }
+                        webUrl: { type: string }
+                        parameters: { type: object, additionalProperties: true }
+                        requestedBy: { type: string }
+                        requestedAt: { type: string, format: date-time }
+                        refreshError: { type: string }
+        '404': { description: İş bulunamadı (ya da başka takımın) }
+    post:
+      tags: [Integrations]
+      summary: Worker pipeline'ı başlat (remediation:manage)
+      description: Parametreleri SSI iş kaydından üretir; gövde yalnızca aksiyonu taşır.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [canonical-scan, copa-prepare, copa-execute, candidate-test] }
+                canonicalBuildId: { type: string, pattern: '^[1-9][0-9]{0,9}$', description: Yalnızca copa-prepare, SSI'ın kaydı yoksa }
+      responses:
+        '201': { description: 'Başlatıldı: { job, run }' }
+        '403': { description: remediation:manage yok }
+        '404': { description: İş bulunamadı }
+        '409': { description: Koşul sağlanmadı ya da aynı pipeline'ın run'ı sürüyor }
+        '422': { description: Geçersiz aksiyon ya da Build ID }
+        '503': { description: Azure DevOps otomasyonu yapılandırılmamış }
+        '504': { description: Azure DevOps'a ulaşılamadı }
+
+  /onboarding/{requestId}/pipeline-runs:
+    parameters:
+      - { name: requestId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Integrations]
+      summary: Onboarding isteğinin import pipeline aksiyonları ve run'ları (onboarding:read)
+      responses:
+        '200': { description: '{ enabled, actions, runs } — /remediation/{jobId}/pipeline-runs ile aynı biçim' }
+        '404': { description: İstek bulunamadı (ya da başka takımın) }
+    post:
+      tags: [Integrations]
+      summary: Onboard Import pipeline'ını başlat (onboarding:create)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [onboard-check, onboard-import] }
+      responses:
+        '201': { description: 'Başlatıldı: { request, run }' }
+        '404': { description: İstek bulunamadı }
+        '409': { description: İstek açık değil, check yapılmamış ya da run sürüyor }
+        '503': { description: Azure DevOps otomasyonu yapılandırılmamış }
+
+  /publish-requests/{requestId}/pipeline-runs:
+    parameters:
+      - { name: requestId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Integrations]
+      summary: Publish talebinin publish/sign pipeline aksiyonları ve run'ları (publish:read)
+      responses:
+        '200': { description: '{ enabled, actions, runs }' }
+        '404': { description: Talep bulunamadı (ya da başka takımın) }
+    post:
+      tags: [Integrations]
+      summary: Controlled Publish ya da Supply-Chain Sign pipeline'ını başlat (publish:approve)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [publish-check, publish-execute, supply-chain-sign] }
+      responses:
+        '201': { description: 'Başlatıldı: { request, run }' }
+        '403': { description: publish:approve yok }
+        '404': { description: Talep bulunamadı }
+        '409': { description: Talep Approved/Published değil, check yapılmamış ya da run sürüyor }
+        '503': { description: Azure DevOps otomasyonu yapılandırılmamış }
+
+  /scans/pipeline-runs:
+    get:
+      tags: [Integrations]
+      summary: Taranmış bir imajın inspection run'ları (scan:read)
+      parameters:
+        - { name: reference, in: query, required: true, schema: { type: string, example: 'ssi-images/onboarded/nginx@sha256:...' } }
+      responses:
+        '200': { description: '{ enabled, actions, runs }' }
+        '404': { description: Takımın görebildiği bir tarama yok }
+    post:
+      tags: [Integrations]
+      summary: Image Inspection pipeline'ını başlat (remediation:manage)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reference, action]
+              properties:
+                reference: { type: string }
+                action: { type: string, enum: [image-inspection] }
+      responses:
+        '201': { description: 'Başlatıldı: { reference, run }' }
+        '404': { description: Takımın görebildiği bir tarama yok }
+        '409': { description: Run sürüyor ya da imaj worker projesinde değil }
+        '503': { description: Azure DevOps otomasyonu yapılandırılmamış }
+
+  /integrations/azure-devops:
+    get:
+      tags: [Integrations]
+      summary: Azure DevOps bağlantı durumu ve pipeline sağlık kontrolü (system:admin)
+      description: >
+        Yapılandırmayı (token hariç) döner ve her yapılandırılmış worker pipeline için
+        salt-okuma `GET pipeline` çağrısı yapar. Entegrasyon kapalıysa `checks` boştur.
+      responses:
+        '200':
+          description: Bağlantı durumu
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [configured, requested, orgUrl, project, ref, pipelines, problems, checkedAt, checks]
+                properties:
+                  configured: { type: boolean }
+                  requested: { type: boolean }
+                  orgUrl: { type: string }
+                  project: { type: string }
+                  ref: { type: string, example: refs/heads/main }
+                  pipelines:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        role: { type: string, example: candidateTest }
+                        variable: { type: string, example: SSI_ADO_PIPELINE_CANDIDATE_TEST }
+                        id: { type: integer, nullable: true }
+                  problems:
+                    type: array
+                    description: Eksik/hatalı değişken adları (değer asla).
+                    items: { type: string }
+                  checkedAt: { type: string, format: date-time }
+                  checks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        role: { type: string }
+                        id: { type: integer, nullable: true }
+                        ok: { type: boolean }
+                        name: { type: string }
+                        error: { type: string }
+        '403':
+          description: system:admin yetkisi yok
+
+  /exceptions:
+    get:
+      tags: [Exceptions]
+      summary: İstisna kuyruğu
+      responses:
+        '200':
+          description: İstisnalar
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Exception' }
+    post:
+      tags: [Exceptions]
+      summary: Yeni istisna talebi aç
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image, cve, reason]
+              properties:
+                image: { type: string }
+                cve: { type: string }
+                reason: { type: string }
+                validUntil: { type: string, format: date }
+      responses:
+        '201':
+          description: Oluşturulan istisna
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Exception' }
+
+  /reports/remediation:
+    get:
+      tags: [Reports]
+      summary: Remediation özeti, geçmişi ve haftalık trend
+      responses:
+        '200':
+          description: Store'daki remediation job'larından hesaplanan rapor
+          headers:
+            X-SSI-Data-Source:
+              schema: { type: string, example: remediation-report-postgres }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RemediationReport' }
+
+  /reports/remediation/{jobId}/document:
+    get:
+      tags: [Reports]
+      operationId: getRemediationReportDocument
+      summary: Before/after remediation report of one job (HTML document)
+      description: >-
+        Opened as a plain browser link, so besides `X-SSI-Tenant` this route also takes the
+        team as the `tenant` query parameter (multi-tenancy on).
+      parameters:
+        - { name: jobId, in: path, required: true, schema: { type: string } }
+        - { name: download, in: query, required: false, schema: { type: boolean, default: false } }
+        - name: tenant
+          in: query
+          required: false
+          description: The team the request acts in, for links that cannot send X-SSI-Tenant.
+          schema: { $ref: '#/components/schemas/TenantId' }
+      responses:
+        '200':
+          description: The report document
+          content:
+            text/html:
+              schema: { type: string }
+        '404': { description: Job not found (or not in the caller's team) }
+
+  /reports/export:
+    get:
+      tags: [Reports]
+      summary: Rapor/envanter dışa aktar (CSV)
+      parameters:
+        - { name: type, in: query, required: true, schema: { type: string, enum: [inventory, remediation] } }
+        - { name: format, in: query, schema: { type: string, enum: [csv], default: csv } }
+      responses:
+        '200':
+          description: CSV dosyası
+          content:
+            text/csv:
+              schema: { type: string, format: binary }
+
+  /audit-events:
+    get:
+      tags: [Audit]
+      summary: Yapılandırılmış denetim/olay zaman çizelgesi
+      description: >-
+        With multi-tenancy on, a team member sees only the events of the team (`tenantId`);
+        platform events and rows older than migration 009 (`tenantId: null`) are visible to
+        platform administrators only. Newest first; filtered on the server. Pages are read with
+        a keyset cursor: pass the `X-SSI-Next-Cursor` of a page as `before` to read the next one
+        (events recorded meanwhile never shift or repeat a row). An invalid filter or cursor is
+        refused (`400`), never ignored.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 250, default: 100 }
+        - name: before
+          in: query
+          required: false
+          description: Opaque cursor from the previous page's `X-SSI-Next-Cursor`
+          schema: { type: string, maxLength: 100 }
+        - $ref: '#/components/parameters/AuditCategory'
+        - $ref: '#/components/parameters/AuditFailures'
+        - $ref: '#/components/parameters/AuditActor'
+        - $ref: '#/components/parameters/AuditResourceType'
+        - $ref: '#/components/parameters/AuditResourceId'
+        - $ref: '#/components/parameters/AuditCorrelationId'
+        - $ref: '#/components/parameters/AuditSearch'
+        - $ref: '#/components/parameters/AuditFrom'
+        - $ref: '#/components/parameters/AuditTo'
+      responses:
+        '200':
+          description: Audit olayları
+          headers:
+            X-SSI-Data-Source:
+              schema: { type: string, example: audit-postgres }
+            X-SSI-Next-Cursor:
+              description: '`before` value of the next page; empty on the last page'
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEvent' }
+        '400': { description: Invalid filter, limit or cursor }
+
+  /audit-events/summary:
+    get:
+      tags: [Audit]
+      summary: Number of events the filters match, in total and per category
+      description: The `category` filter is ignored here, so every category shows its own count.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - $ref: '#/components/parameters/AuditFailures'
+        - $ref: '#/components/parameters/AuditActor'
+        - $ref: '#/components/parameters/AuditResourceType'
+        - $ref: '#/components/parameters/AuditResourceId'
+        - $ref: '#/components/parameters/AuditCorrelationId'
+        - $ref: '#/components/parameters/AuditSearch'
+        - $ref: '#/components/parameters/AuditFrom'
+        - $ref: '#/components/parameters/AuditTo'
+      responses:
+        '200':
+          description: Counts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total, categories]
+                properties:
+                  total: { type: integer }
+                  categories:
+                    type: object
+                    additionalProperties: { type: integer }
+                    example: { all: 61, signin: 9, access: 5, remediation: 13, publish: 13, onboarding: 12, users: 0, other: 9 }
+        '400': { description: Invalid filter }
+
+  /audit-events/export:
+    get:
+      tags: [Audit]
+      summary: CSV export of every matching event in a period
+      description: >-
+        Requires `audit:read`. `from` and `to` are required; the period ends at the time of the
+        request at the latest. At most 50,000 rows: a wider request is refused (`422`) before
+        anything is sent. The file is RFC 4180 CSV in UTF-8 with a byte order mark; no cell can
+        start a spreadsheet formula. Every export and every refused export is recorded in the
+        audit log (`audit.exported`, `audit.export.rejected`).
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+        - name: format
+          in: query
+          required: false
+          schema: { type: string, enum: [csv], default: csv }
+        - $ref: '#/components/parameters/AuditCategory'
+        - $ref: '#/components/parameters/AuditFailures'
+        - $ref: '#/components/parameters/AuditActor'
+        - $ref: '#/components/parameters/AuditResourceType'
+        - $ref: '#/components/parameters/AuditResourceId'
+        - $ref: '#/components/parameters/AuditCorrelationId'
+        - $ref: '#/components/parameters/AuditSearch'
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: The CSV file
+          headers:
+            Content-Disposition:
+              schema: { type: string, example: 'attachment; filename="ssi-audit-20261101-20261117.csv"' }
+            X-SSI-Audit-Rows:
+              schema: { type: integer }
+          content:
+            text/csv:
+              schema: { type: string }
+        '400': { description: Missing period or invalid filter }
+        '422': { description: More than 50,000 events match }
+
+  /tenants:
+    get:
+      tags: [Teams]
+      operationId: listTenants
+      summary: List teams (platform administrators)
+      description: Requires `tenant:manage` (admin). Works while multi-tenancy is off, so teams can be prepared first.
+      responses:
+        '200':
+          description: Teams with their member counts
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Tenant' } }
+        '401': { description: Not signed in }
+        '403': { description: Not a platform administrator }
+    post:
+      tags: [Teams]
+      operationId: createTenant
+      summary: Create a team
+      description: Audited as `tenant.created`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, displayName]
+              properties:
+                id: { $ref: '#/components/schemas/TenantId' }
+                displayName: { type: string, minLength: 1, maxLength: 128, description: One line of visible text }
+                harbor: { $ref: '#/components/schemas/TenantHarborTarget' }
+      responses:
+        '201':
+          description: The new team (status active)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '400': { description: Invalid id, name or Harbor target }
+        '403': { description: Not a platform administrator }
+        '409': { description: A team with this id already exists, or its Harbor folder belongs to another team }
+
+  /tenants/{tenantId}:
+    parameters:
+      - { name: tenantId, in: path, required: true, schema: { $ref: '#/components/schemas/TenantId' } }
+    get:
+      tags: [Teams]
+      operationId: getTenant
+      summary: Read a team
+      responses:
+        '200':
+          description: The team
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '404': { description: Team not found }
+    patch:
+      tags: [Teams]
+      operationId: updateTenant
+      summary: Rename a team, change its Harbor target, or disable / enable it
+      description: >-
+        Send `rowVersion` (as read) to refuse the change when someone else changed the team
+        meanwhile (409). Members of a disabled team lose access to it; its records stay. The
+        `default` team cannot be disabled. Audited as `tenant.updated`, `tenant.disabled` or
+        `tenant.enabled`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                displayName: { type: string, minLength: 1, maxLength: 128 }
+                status: { type: string, enum: [active, disabled] }
+                harbor: { $ref: '#/components/schemas/TenantHarborTarget' }
+                rowVersion: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: The updated team
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '400': { description: Invalid or empty change }
+        '404': { description: Team not found }
+        '409': { description: The default team cannot be disabled, the team changed meanwhile, or the Harbor folder belongs to another team }
+
+  /tenants/{tenantId}/members:
+    get:
+      tags: [Teams]
+      operationId: listTenantMembers
+      summary: List the members of a team
+      parameters:
+        - { name: tenantId, in: path, required: true, schema: { $ref: '#/components/schemas/TenantId' } }
+      responses:
+        '200':
+          description: Memberships
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/TenantMembership' } }
+        '404': { description: Team not found }
+
+  /tenants/{tenantId}/members/{username}:
+    parameters:
+      - { name: tenantId, in: path, required: true, schema: { $ref: '#/components/schemas/TenantId' } }
+      - { name: username, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [Teams]
+      operationId: setTenantMembership
+      summary: Add a user to a team, or change the user's team role
+      description: >-
+        The user must exist in Users and must not be a platform administrator (they act in
+        every team). Audited as `tenant.membership.added` or `tenant.membership.updated`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string, enum: [viewer, operator, approver] }
+      responses:
+        '200':
+          description: Role changed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantMembership' }
+        '201':
+          description: Member added
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TenantMembership' }
+        '400': { description: Invalid role, or the user is a platform administrator }
+        '404': { description: Team or user not found }
+    delete:
+      tags: [Teams]
+      operationId: removeTenantMembership
+      summary: Remove a user from a team
+      description: Audited as `tenant.membership.removed`.
+      responses:
+        '200': { description: Removed }
+        '404': { description: Team not found, or the user is not a member }
+
+  /jobs/{jobId}:
+    get:
+      tags: [Jobs]
+      summary: Async iş durumu (scan/remediation/rebuild/publish/ingest)
+      parameters: [ { name: jobId, in: path, required: true, schema: { type: string } } ]
+      responses:
+        '200':
+          description: İş durumu
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Placeholder — gerçek LDAP/AD + RBAC Faz 5'te.
+    workerEvidenceHmac:
+      type: apiKey
+      in: header
+      name: X-SSI-Evidence-Signature
+      description: >-
+        `sha256=<hex>` HMAC imzası. İmza payload'ı; `ssi-remediation-evidence-v1`,
+        X-SSI-Evidence-Timestamp, path jobId, X-SSI-Evidence-Worker-ID ve
+        X-SSI-Evidence-Content-SHA256 alanlarının newline ile birleştirilmiş halidir.
+
+  parameters:
+    AuditCategory:
+      name: category
+      in: query
+      required: false
+      schema: { type: string, enum: [all, signin, access, remediation, publish, onboarding, users, other], default: all }
+    AuditFailures:
+      name: failures
+      in: query
+      required: false
+      description: 'true: only events whose outcome is not success'
+      schema: { type: boolean, default: false }
+    AuditActor:
+      name: actor
+      in: query
+      required: false
+      schema: { type: string, maxLength: 200 }
+    AuditResourceType:
+      name: resourceType
+      in: query
+      required: false
+      schema: { type: string, maxLength: 200 }
+    AuditResourceId:
+      name: resourceId
+      in: query
+      required: false
+      schema: { type: string, maxLength: 200 }
+    AuditCorrelationId:
+      name: correlationId
+      in: query
+      required: false
+      schema: { type: string, format: uuid }
+    AuditSearch:
+      name: q
+      in: query
+      required: false
+      description: Case-insensitive text in the summary, event type, actor, resource or correlation ID (wildcards are literal)
+      schema: { type: string, maxLength: 200 }
+    AuditFrom:
+      name: from
+      in: query
+      required: false
+      description: Inclusive start (ISO 8601 date or date-time)
+      schema: { type: string, format: date-time }
+    AuditTo:
+      name: to
+      in: query
+      required: false
+      description: Exclusive end (ISO 8601 date or date-time)
+      schema: { type: string, format: date-time }
+    TenantHeader:
+      name: X-SSI-Tenant
+      in: header
+      required: false
+      description: >-
+        The team the request acts in (multi-tenancy on). Optional for a member of one active
+        team and for platform administrators (no header = every team; creating a record then
+        needs one). Required for a member of several teams. Ignored while multi-tenancy is off.
+      schema: { $ref: '#/components/schemas/TenantId' }
+    ImageId:
+      name: imageId
+      in: path
+      required: true
+      schema: { type: string }
+      example: node-22
+
+  responses:
+    Unauthorized:
+      description: Kimlik doğrulama gerekli
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Kaynak bulunamadı
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    JobAccepted:
+      description: İş kabul edildi (async); jobId ile GET /jobs/{jobId} takip edilir
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Job' }
+
+  schemas:
+    Severity:
+      type: string
+      enum: [Critical, High, Medium, Low]
+    ImageType:
+      type: string
+      enum: [Base, Runtime, Final, Debug]
+    Scanner:
+      type: string
+      enum: [Trivy, Grype, Docker Scout]
+
+    SeverityCounts:
+      type: object
+      properties:
+        critical: { type: integer }
+        high: { type: integer }
+        medium: { type: integer }
+        low: { type: integer }
+
+    Image:
+      type: object
+      properties:
+        id: { type: string, example: node-22 }
+        tenantId: { type: string, description: 'Multi-tenancy on only: the team the image belongs to' }
+        tenantName: { type: string, description: 'Multi-tenancy on only: that team''s name' }
+        tenantArea: { type: string, nullable: true, enum: [onboarded, approved], description: 'Multi-tenancy on only: approved = shared catalog (publisher in tenantName)' }
+        name: { type: string, example: secure/node }
+        version: { type: string, example: 22.4.1-r20260701 }
+        type: { $ref: '#/components/schemas/ImageType' }
+        runtime: { type: string, example: Node.js }
+        status: { type: string, example: Approved }
+        digest: { type: string, example: 'sha256:8f4b91c7e4d2' }
+        source: { type: string, example: Docker Hub }
+        baseOs: { type: string, example: Wolfi }
+        size: { type: string, example: 92 MB }
+        owner: { type: string }
+        consumers: { type: integer }
+        firstOnboarded: { type: string }
+        lastScanned: { type: string }
+        rebuiltAt: { type: string }
+        maxCvss: { type: number, format: float }
+        cve: { $ref: '#/components/schemas/SeverityCounts' }
+        sbom: { type: boolean }
+        signature: { type: boolean }
+        provenance: { type: boolean }
+        tags:
+          type: array
+          items: { type: string }
+
+    Finding:
+      type: object
+      properties:
+        cve: { type: string, example: CVE-2026-18421 }
+        package: { type: string, example: nginx }
+        installed: { type: string, example: 1.25.4 }
+        fixed: { type: string, example: 1.25.5 }
+        severity: { $ref: '#/components/schemas/Severity' }
+        cvss: { type: number, format: float, example: 7.5 }
+        cvssVector: { type: string, example: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H' }
+        epss: { type: number, format: float, nullable: true, example: 0.62, description: '0-1 arası istismar olasılığı; Trivy çıktısında yoksa null, sonraki fazda CVE ID üzerinden enrich edilir' }
+        status: { type: string, enum: [Fix available, No fix] }
+        title: { type: string }
+        description: { type: string }
+        primaryUrl: { type: string }
+        target: { type: string, example: ubuntu:22.04 }
+        class: { type: string, example: os-pkgs }
+        type: { type: string, example: ubuntu }
+
+    ScanReport:
+      type: object
+      properties:
+        id: { type: string }
+        imageId: { type: string }
+        image: { type: string, example: registry.example.com/payment-api:1.2.3 }
+        digest: { type: string, example: 'sha256:5b6fcb7f8d5b6b0db56b7db6dbfd7e8d9ef1f2c7' }
+        os: { type: string, example: ubuntu 22.04 }
+        scanner: { $ref: '#/components/schemas/Scanner' }
+        scannedAt: { type: string }
+        artifactType: { type: string, example: container_image }
+        schemaVersion: { type: integer, example: 2 }
+        findings:
+          type: array
+          items: { $ref: '#/components/schemas/Finding' }
+
+    FixedFinding:
+      type: object
+      properties:
+        cve: { type: string }
+        package: { type: string }
+        from: { type: string }
+        to: { type: string }
+        severity: { $ref: '#/components/schemas/Severity' }
+
+    RemediationFinding:
+      type: object
+      properties:
+        cve: { type: string }
+        package: { type: string }
+        from: { type: string }
+        to: { type: string }
+        severity: { $ref: '#/components/schemas/Severity' }
+        cvss: { type: number, format: float }
+        reason: { type: string, description: 'Kapsam dışı veya planlanamama gerekçesi' }
+
+    DryRunRemediationRequest:
+      type: object
+      required: [dryRun]
+      properties:
+        scanReportId:
+          type: string
+          description: Route içindeki imageId ile aynı normalize scan report kimliği
+        dryRun:
+          type: boolean
+          enum: [true]
+          description: Gerçek image pull, Copa patch, registry push veya re-scan yapılmayacağını zorunlu kılar
+
+    RemediationJob:
+      type: object
+      properties:
+        id: { type: string, example: RM-2047 }
+        parentJobId: { type: string, description: 'Execution kaydının bağlı olduğu Dry Run job kimliği' }
+        mode: { type: string, enum: [dry-run, execution] }
+        imageId: { type: string }
+        image: { type: string }
+        scanReportId: { type: string }
+        sourceDigest: { type: string }
+        fromTag: { type: string }
+        toTag: { type: string }
+        proposedPatchedTag: { type: string, description: 'Dry Run sırasında önerilen output tag; henüz registryde yoktur' }
+        patchedImageTag: { type: string, description: 'Remediation sonrası üretilen imaj tag bilgisi' }
+        patchedImageDigest: { type: string, description: 'Remediation sonrası üretilen imaj digest bilgisi' }
+        engine: { type: string, example: Copacetic }
+        engineVersion: { type: string, example: v0.14.2 }
+        execution: { type: string, enum: [not-run, queued, running, completed, failed] }
+        lifecycleState: { type: string, enum: [planned, queued, running, patched, rescanning, verified, failed, blocked] }
+        scope: { type: string, example: os-packages-only }
+        baseFrom: { type: string }
+        baseTo: { type: string }
+        createdAt: { type: string }
+        startedAt: { type: string }
+        verifiedAt: { type: string }
+        verificationStatus: { type: string, enum: [Pending, Passed, Failed] }
+        status: { type: string, enum: [Planned, Queued, Running, Patched, Re-scanning, Verified, Published, Blocked, Failed] }
+        log: { type: string, description: 'Remediation engine çalışma çıktısı / özet log' }
+        logs:
+          type: array
+          items: { type: string }
+        error: { type: string, nullable: true, description: 'Başarısız job hata mesajı' }
+        before: { $ref: '#/components/schemas/SeverityCounts' }
+        after:
+          type: object
+          nullable: true
+          allOf: [ { $ref: '#/components/schemas/SeverityCounts' } ]
+        plannedFixes:
+          type: array
+          items: { $ref: '#/components/schemas/RemediationFinding' }
+        packageUpdates:
+          type: array
+          items: { $ref: '#/components/schemas/RemediationFinding' }
+        fixed:
+          type: array
+          items: { $ref: '#/components/schemas/RemediationFinding' }
+        remaining:
+          type: array
+          items: { $ref: '#/components/schemas/RemediationFinding' }
+        excluded:
+          type: array
+          items: { $ref: '#/components/schemas/RemediationFinding' }
+        lifecycleEvents:
+          type: array
+          items: { $ref: '#/components/schemas/RemediationLifecycleEvent' }
+        canonicalReport: { $ref: '#/components/schemas/CanonicalTrivyReceipt' }
+        executionReadiness: { $ref: '#/components/schemas/RemediationExecutionReadiness' }
+        verificationEvidence: { $ref: '#/components/schemas/RemediationEvidenceReceipt' }
+        fullImageComparison: { $ref: '#/components/schemas/FullImageComparison' }
+        publishGate: { $ref: '#/components/schemas/PublishGate' }
+
+    CanonicalTrivyReceipt:
+      type: object
+      required: [reportId, contentDigest, sourceDigest, artifactName, schemaVersion, scope, resultClasses, findingCount]
+      description: >-
+        Web API'nin raw JSON'u saklamadan kabul ettiği canonical Trivy raporuna ait denetlenebilir
+        metadata. Content digest, yüklenen UTF-8 dosyanın ham içeriğinin SHA-256 değeridir.
+        Receipt metadata seçili store sürücüsünde (memory veya postgres) tutulur;
+        raw canonical JSON job kaydına yazılmaz.
+      properties:
+        reportId: { type: string, example: CTR-42ab7e9c120f }
+        contentDigest:
+          type: string
+          pattern: '^sha256:[a-fA-F0-9]{64}$'
+          description: Yüklenen canonical Trivy JSON dosyasının ham UTF-8 içeriğine ait SHA-256.
+        sourceDigest: { type: string, example: sha256:1e8b199249d6d0ef3419ddc6eda2348d9fbdb10d350d3bb70aa98e87faa227c9 }
+        artifactName: { type: string }
+        generatedAt: { type: string, format: date-time, nullable: true }
+        trivyVersion: { type: string, nullable: true }
+        schemaVersion: { type: integer, enum: [2] }
+        scope: { type: string, enum: [os-packages-only] }
+        resultClasses:
+          type: array
+          items: { type: string, enum: [os-pkgs] }
+        findingCount: { type: integer, minimum: 0 }
+        os:
+          type: object
+          additionalProperties: true
+        acceptedAt: { type: string, format: date-time }
+
+    CanonicalTrivyReport:
+      type: object
+      required: [SchemaVersion, ArtifactName, ArtifactType, Metadata, Results]
+      description: >-
+        Ayrı scan worker'ın ürettiği raw Trivy JSON. API, ek Trivy alanlarını koruyacak
+        biçimde kabul eder fakat yalnızca os-pkgs sonuçlu report'ları doğrular.
+      properties:
+        SchemaVersion: { type: integer, enum: [2] }
+        ArtifactName: { type: string }
+        ArtifactType: { type: string, enum: [container_image] }
+        Metadata:
+          type: object
+          properties:
+            ImageID: { type: string }
+            RepoDigests:
+              type: array
+              items: { type: string }
+            OS:
+              type: object
+              additionalProperties: true
+          additionalProperties: true
+        Results:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [Class]
+            properties:
+              Class: { type: string, enum: [os-pkgs] }
+            additionalProperties: true
+      additionalProperties: true
+
+    RemediationVerificationEvidence:
+      type: object
+      required: [contractVersion, mode, source, canonicalInput, output, engine, verification, configIntegrity, result]
+      additionalProperties: false
+      properties:
+        contractVersion: { type: string, enum: [ssi.copa-remediation-poc/v1alpha1] }
+        mode: { type: string, enum: [approved-poc-execution] }
+        generatedAt: { type: string, format: date-time }
+        source:
+          type: object
+          required: [immutableReference, digest]
+          properties:
+            immutableReference: { type: string }
+            digest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+          additionalProperties: true
+        canonicalInput:
+          type: object
+          required: [contentDigest, trivyVersion, scope, findings]
+          properties:
+            contentDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+            trivyVersion: { type: string }
+            scope: { type: string, enum: [os-packages-only] }
+            findings: { type: integer, minimum: 0 }
+          additionalProperties: true
+        output:
+          type: object
+          required: [tagReference, immutableReference, digest, approvedPublishAttempted]
+          properties:
+            tagReference: { type: string, description: 'Mutable latest olmayan test output tag referansı' }
+            immutableReference: { type: string }
+            digest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+            approvedPublishAttempted: { type: boolean, enum: [false] }
+          additionalProperties: true
+        engine:
+          type: object
+          required: [name, version, packageScope]
+          properties:
+            name: { type: string, example: Copacetic BuildKit frontend }
+            version: { type: string, example: 0.14.2 }
+            image: { type: string }
+            packageScope: { type: string, enum: [os] }
+          additionalProperties: true
+        verification:
+          type: object
+          required: [scanner, reScanPatchedDigest, before, after, fixed, remaining, passed]
+          properties:
+            scanner: { type: string, enum: [Trivy] }
+            reScanPatchedDigest: { type: boolean, enum: [true] }
+            before: { $ref: '#/components/schemas/VerificationFindingSummary' }
+            after: { $ref: '#/components/schemas/VerificationFindingSummary' }
+            fixed:
+              type: array
+              items: { $ref: '#/components/schemas/EvidenceFinding' }
+            remaining:
+              type: array
+              items: { $ref: '#/components/schemas/EvidenceFinding' }
+            passed: { type: boolean, enum: [true] }
+          additionalProperties: true
+        configIntegrity: { $ref: '#/components/schemas/ImageConfigIntegrityEvidence' }
+        result:
+          type: object
+          required: [status, patchAttempted, registryWriteAttempted, verificationScanAttempted, approvedPublishAttempted]
+          properties:
+            status: { type: string, enum: [verified-poc-output] }
+            patchAttempted: { type: boolean, enum: [true] }
+            registryWriteAttempted: { type: boolean, enum: [true] }
+            verificationScanAttempted: { type: boolean, enum: [true] }
+            approvedPublishAttempted: { type: boolean, enum: [false] }
+          additionalProperties: true
+
+    CandidateTestEvidence:
+      type: object
+      description: >-
+        Result of azure-pipelines-candidate-test.yml (scripts/candidate-test.mjs). The source
+        and the candidate run side by side; healthcheck may be not-applicable, every other
+        check must pass. A removed OS package fails the package-inventory check.
+      required: [contractVersion, generatedAt, remediationJobId, source, candidate, platform, checks, packageChanges, passed]
+      properties:
+        contractVersion: { type: string, enum: [ssi.candidate-test/v1] }
+        generatedAt: { type: string, format: date-time }
+        remediationJobId: { type: string, pattern: '^RM-EXEC-[0-9]{4,}$' }
+        source:
+          type: object
+          required: [immutableReference, digest]
+          properties:
+            immutableReference: { type: string }
+            digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        candidate:
+          type: object
+          required: [immutableReference, digest]
+          properties:
+            immutableReference: { type: string }
+            digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$', description: "Must equal the job's patchedImageDigest" }
+        platform: { type: string, example: linux/amd64 }
+        runner:
+          type: object
+          properties:
+            pipeline: { type: string }
+            buildId: { type: string }
+            agent: { type: string }
+        startup:
+          type: object
+          description: Observed container state of source and candidate (running, exited or not-started; exit code; health)
+        checks:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: object
+            required: [id, status, detail]
+            properties:
+              id: { type: string, enum: [image-config, startup, healthcheck, package-inventory] }
+              status: { type: string, enum: [pass, fail, not-applicable] }
+              detail: { type: string, maxLength: 500 }
+        packageChanges:
+          type: object
+          required: [summary, changes]
+          properties:
+            summary:
+              type: object
+              required: [unchanged, changed, added, removed, majorVersionChanges]
+            changes:
+              type: array
+              maxItems: 5000
+              items:
+                type: object
+                required: [name, from, to, change, majorVersionChange]
+                properties:
+                  name: { type: string }
+                  arch: { type: string }
+                  from: { type: string }
+                  to: { type: string }
+                  change: { type: string, enum: [changed, added, removed] }
+                  majorVersionChange: { type: boolean }
+        imageFacts:
+          type: object
+          description: >-
+            Optional facts of both images for the comparison (GET /remediation/{jobId}/comparison),
+            from `docker image inspect`. Env lists variable names only; an entry with a value
+            ("NAME=value") is rejected with 422. If present, differing configurations require
+            the image-config check to fail.
+          required: [source, candidate]
+          properties:
+            source: { $ref: '#/components/schemas/CandidateTestImageFacts' }
+            candidate: { $ref: '#/components/schemas/CandidateTestImageFacts' }
+        passed: { type: boolean, description: Must equal the verdict SSI derives from the checks }
+
+    CandidateTestImageFacts:
+      type: object
+      required: [sizeBytes, diffIds, config]
+      properties:
+        sizeBytes: { type: integer, minimum: 0, nullable: true, description: Image size as reported by Docker }
+        diffIds:
+          type: array
+          maxItems: 512
+          description: RootFS layer diff IDs (uncompressed content digests), bottom to top
+          items: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        config:
+          type: object
+          maxProperties: 13
+          description: >-
+            Runtime fields only (Cmd, Entrypoint, Env, ExposedPorts, Healthcheck, Labels, OnBuild,
+            Shell, StopSignal, StopTimeout, User, Volumes, WorkingDir); at most 64 KiB.
+          properties:
+            Env:
+              type: array
+              maxItems: 1000
+              items: { type: string, minLength: 1, maxLength: 256, pattern: '^[^=]+$' }
+          additionalProperties: true
+
+    ImageInspectionEvidence:
+      type: object
+      description: >-
+        Result of azure-pipelines-image-inspection.yml (scripts/image-inspection.mjs) for ONE image.
+        No container is started from the image. Env lists variable names only.
+      required: [contractVersion, generatedAt, image, platform, os, packages, facts]
+      properties:
+        contractVersion: { type: string, enum: [ssi.image-inspection/v1] }
+        generatedAt: { type: string, format: date-time }
+        image:
+          type: object
+          required: [immutableReference, digest]
+          properties:
+            immutableReference: { type: string, description: '<registry>/<project>/<repository>@sha256:<64 hex>' }
+            digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$', description: Must equal the path digest }
+        platform: { type: string, example: linux/amd64 }
+        os: { type: string, maxLength: 120, example: alpine 3.22.2 }
+        runner:
+          type: object
+          properties:
+            pipeline: { type: string }
+            buildId: { type: string }
+            agent: { type: string }
+        packages:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          description: Every OS package; name + arch is unique
+          items:
+            type: object
+            required: [name, version]
+            properties:
+              name: { type: string, maxLength: 200 }
+              arch: { type: string, maxLength: 64 }
+              version: { type: string, maxLength: 200 }
+        facts: { $ref: '#/components/schemas/CandidateTestImageFacts' }
+
+    ImageConfigIntegrityEvidence:
+      type: object
+      description: >-
+        Worker proof that the patched output keeps the source runtime configuration
+        (Entrypoint, Cmd, Env, ExposedPorts, StopSignal, ...). "restored" means the Copa
+        output lost it and the worker restored it from the source without changing any layer.
+      required:
+        [contractVersion, status, verified, platform, restoredFields, layersPreserved, sourceConfigDigest,
+         copaOutputDigest, copaConfigDigest, outputDigest, outputConfigDigest, runtimeConfigDigest]
+      properties:
+        contractVersion: { type: string, enum: [ssi.image-config-integrity/v1] }
+        status: { type: string, enum: [preserved, restored] }
+        verified: { type: boolean, enum: [true] }
+        platform: { type: string, example: linux/amd64 }
+        restoredFields:
+          type: array
+          description: Empty when preserved; the changed runtime fields when restored.
+          items: { type: string, pattern: '^[A-Za-z][A-Za-z0-9]{0,63}$' }
+        layersPreserved: { type: boolean, enum: [true] }
+        sourceConfigDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        copaOutputDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        copaConfigDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        outputDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$', description: Must equal output.digest. }
+        outputConfigDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        runtimeConfigDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+      additionalProperties: false
+
+    VerificationFindingSummary:
+      type: object
+      required: [findings, severity]
+      properties:
+        findings: { type: integer, minimum: 0 }
+        severity: { $ref: '#/components/schemas/SeverityCounts' }
+
+    EvidenceFinding:
+      type: object
+      required: [cve, package]
+      properties:
+        cve: { type: string }
+        package: { type: string }
+        fixedVersion: { type: string }
+      additionalProperties: true
+
+    RemediationEvidenceReceipt:
+      type: object
+      required: [contractVersion, evidenceDigest, acceptedAt, sourceDigest, canonicalContentDigest, outputDigest]
+      properties:
+        contractVersion: { type: string }
+        evidenceDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        acceptedAt: { type: string, format: date-time }
+        sourceDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        canonicalContentDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        outputDigest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        engine: { type: string }
+        engineVersion: { type: string }
+        scanner: { type: string }
+
+    FullImageComparison:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [available, unavailable] }
+        reason: { type: string }
+        scope: { type: string, enum: [full-image] }
+        scanner: { type: string }
+        scannedAt: { type: string }
+        source: { $ref: '#/components/schemas/ImageScanSummary' }
+        output: { $ref: '#/components/schemas/ImageScanSummary' }
+        reducedBy: { type: integer }
+        remainingOutsideCanonicalOsScope: { type: integer, minimum: 0 }
+
+    ImageScanSummary:
+      type: object
+      required: [digest, findings, severity]
+      properties:
+        digest: { type: string, pattern: '^sha256:[a-fA-F0-9]{64}$' }
+        findings: { type: integer, minimum: 0 }
+        severity: { $ref: '#/components/schemas/SeverityCounts' }
+
+    PublishGate:
+      type: object
+      required: [allowed, status, reason, approvedPublishAttempted]
+      properties:
+        allowed: { type: boolean, enum: [false] }
+        status: { type: string, enum: [Blocked] }
+        reason: { type: string }
+        approvedPublishAttempted: { type: boolean, enum: [false] }
+
+    RemediationLifecycleEvent:
+      type: object
+      required: [state, at, actor, message]
+      properties:
+        state: { type: string, enum: [planned, queued, running, patched, rescanning, verified, failed, blocked] }
+        at: { type: string, format: date-time }
+        actor: { type: string, example: worker }
+        message: { type: string }
+
+    RemediationExecutionReadiness:
+      type: object
+      required: [contractVersion, jobId, lifecycleState, ready, dispatchAllowed, workerConfigured, requirements]
+      properties:
+        contractVersion: { type: string, example: ssi.remediation-worker/v1alpha1 }
+        jobId: { type: string }
+        lifecycleState: { type: string, enum: [planned, queued, running, patched, rescanning, verified, failed, blocked] }
+        lifecycleLabel: { type: string }
+        ready: { type: boolean }
+        dispatchAllowed:
+          type: boolean
+          description: Tüm koşullar sağlandığında ve SSI Copa worker'ını Azure DevOps'ta başlatabildiğinde true.
+        workerConfigured:
+          type: boolean
+          description: Azure DevOps otomasyonu ve Copa pipeline'ı ayarlı (SSI worker'ı kendisi başlatabilir).
+        message: { type: string }
+        blockers:
+          type: array
+          items: { type: string }
+        requirements:
+          type: array
+          items: { $ref: '#/components/schemas/RemediationReadinessRequirement' }
+
+    RemediationReadinessRequirement:
+      type: object
+      required: [id, label, met, detail]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        met: { type: boolean }
+        detail: { type: string }
+
+    RemediationHandoffManifest:
+      type: object
+      required: [contractVersion, kind, metadata, spec, safeguards]
+      description: >-
+        İzole worker için prepare-only, credential-free ve immutable-digest tabanlı handoff
+        kaydı. API bu endpoint üzerinden dispatch yapmaz.
+      properties:
+        contractVersion: { type: string, example: ssi.remediation-worker/v1alpha1 }
+        kind: { type: string, enum: [RemediationHandoffManifest] }
+        metadata:
+          type: object
+          required: [jobId, preparedAt, idempotencyKey]
+          properties:
+            jobId: { type: string }
+            preparedAt: { type: string, format: date-time }
+            idempotencyKey: { type: string }
+        spec:
+          type: object
+          required: [executionMode, source, canonicalInput, remediation, output, verification]
+          properties:
+            executionMode: { type: string, enum: [prepare-only] }
+            source:
+              type: object
+              required: [repository, digest, immutableReference]
+              properties:
+                repository: { type: string }
+                digest: { type: string }
+                immutableReference: { type: string }
+            canonicalInput:
+              type: object
+              required: [reportId, contentDigest, sourceDigest, schemaVersion, scope, rawReportEmbedded]
+              properties:
+                reportId: { type: string }
+                contentDigest: { type: string }
+                sourceDigest: { type: string }
+                artifactName: { type: string }
+                schemaVersion: { type: integer, enum: [2] }
+                scope: { type: string, enum: [os-packages-only] }
+                findingCount: { type: integer, minimum: 0 }
+                trivyVersion: { type: string }
+                rawReportEmbedded: { type: boolean, enum: [false] }
+                delivery:
+                  type: object
+                  properties:
+                    mode: { type: string, enum: [trusted-job-artifact] }
+                    rawReportEmbedded: { type: boolean, enum: [false] }
+                    workerFetchRequired: { type: boolean, enum: [true] }
+                    contentDigestRequired: { type: boolean, enum: [true] }
+            remediation:
+              type: object
+              properties:
+                engine:
+                  type: object
+                  properties:
+                    name: { type: string, example: Copacetic }
+                    version: { type: string, example: v0.14.2 }
+                scope: { type: string, enum: [os-packages-only] }
+                plannedFindingCount: { type: integer, minimum: 1 }
+                packageUpdateCount: { type: integer, minimum: 1 }
+                findings:
+                  type: array
+                  items: { $ref: '#/components/schemas/RemediationFinding' }
+                packageUpdates:
+                  type: array
+                  items: { $ref: '#/components/schemas/RemediationFinding' }
+            output:
+              type: object
+              properties:
+                proposedReference: { type: string }
+                sourceMutation: { type: string, enum: [forbidden] }
+                registryWrite: { type: string, enum: [worker-runtime-only] }
+                publishAllowed: { type: boolean, enum: [false] }
+            verification:
+              type: object
+              properties:
+                reScanPatchedDigest: { type: boolean, enum: [true] }
+                blockPublishUntilVerified: { type: boolean, enum: [true] }
+        safeguards:
+          type: object
+          required: [webContainerDispatch, dockerSocketInWebContainer, registryCredentialsEmbedded]
+          properties:
+            webContainerDispatch: { type: boolean, enum: [false] }
+            dockerSocketInWebContainer: { type: boolean, enum: [false] }
+            registryCredentialsEmbedded: { type: boolean, enum: [false] }
+
+    IngestJob:
+      type: object
+      properties:
+        id: { type: string, example: IN-2049 }
+        image: { type: string }
+        source: { type: string }
+        scanner: { $ref: '#/components/schemas/Scanner' }
+        status: { type: string, enum: [Queued, Pulling, Scanning, Scan complete, Failed] }
+        at: { type: string }
+
+    PublishItem:
+      type: object
+      properties:
+        id: { type: string }
+        imageId: { type: string }
+        image: { type: string }
+        tag: { type: string }
+        digest: { type: string }
+        registry: { type: string, example: registry.example.com }
+        repo: { type: string }
+        signature: { type: string, example: Cosign }
+        signed: { type: boolean }
+        sbom: { type: boolean }
+        provenance: { type: boolean }
+        policyPass: { type: boolean }
+        status: { type: string, enum: [Pending, Publishing, Published, Blocked] }
+        at: { type: string }
+
+    PolicyRule:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        target: { type: string }
+        state: { type: string, example: Enforced }
+
+    PolicyResult:
+      type: object
+      properties:
+        pass: { type: boolean }
+        findings:
+          type: array
+          items: { type: string }
+
+    Exception:
+      type: object
+      properties:
+        id: { type: string, example: EX-1024 }
+        image: { type: string }
+        cve: { type: string }
+        status: { type: string, enum: [Review, Approved, Rejected] }
+        validUntil: { type: string, format: date }
+        owner: { type: string }
+        reason: { type: string }
+
+    SbomComponent:
+      type: object
+      properties:
+        name: { type: string }
+        version: { type: string }
+        license: { type: string }
+
+    AuditEvent:
+      type: object
+      required: [id, eventType, action, actorId, resourceType, correlationId, outcome, severity, summary, metadata, occurredAt]
+      properties:
+        id: { type: string, format: uuid }
+        tenantId: { type: string, nullable: true, example: default, description: 'Team of the record; null for platform events and rows older than migration 009' }
+        eventType: { type: string, example: remediation.verification-evidence.accepted }
+        action: { type: string, example: accept-verification-evidence }
+        actorId: { type: string, example: ssi-api }
+        resourceType: { type: string, example: remediation-job }
+        resourceId: { type: string, nullable: true, example: RM-EXEC-0001 }
+        correlationId: { type: string, format: uuid }
+        outcome: { type: string, enum: [success, failure, denied] }
+        severity: { type: string, enum: [info, warning, error] }
+        summary: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Hassas anahtarları server tarafından maskelenmiş olay metadata'sı.
+        occurredAt: { type: string, format: date-time }
+
+    HealthStatus:
+      type: object
+      description: Public, unauthenticated readiness probe. Failure details are logged server-side only.
+      required: [status, timestamp]
+      properties:
+        status: { type: string, enum: [ok, degraded], description: 'degraded (HTTP 503) when persistence is unreachable' }
+        timestamp: { type: string, format: date-time }
+
+    SummaryReport:
+      type: object
+      properties:
+        inventorySize: { type: integer }
+        openCriticalHigh: { type: integer }
+        cvesRemediated: { type: integer }
+        avgMaxCvss: { type: number, format: float }
+        coveragePct: { type: integer, description: 'SBOM + signature kapsamı %' }
+
+    CveTrendPoint:
+      type: object
+      required: [week, critical, high, medium]
+      properties:
+        week: { type: string, example: 2026-W30 }
+        critical: { type: integer, minimum: 0 }
+        high: { type: integer, minimum: 0 }
+        medium: { type: integer, minimum: 0 }
+
+    RemediationReportSummary:
+      type: object
+      required: [totalJobs, verifiedJobs, plannedJobs, blockedJobs, cvesRemediated, publishBlocked]
+      properties:
+        totalJobs: { type: integer, minimum: 0 }
+        verifiedJobs: { type: integer, minimum: 0 }
+        plannedJobs: { type: integer, minimum: 0 }
+        blockedJobs: { type: integer, minimum: 0 }
+        cvesRemediated: { type: integer, minimum: 0 }
+        publishBlocked: { type: integer, minimum: 0 }
+
+    RemediationReport:
+      type: object
+      required: [generatedAt, summary, history, trend]
+      properties:
+        generatedAt: { type: string, format: date-time }
+        summary: { $ref: '#/components/schemas/RemediationReportSummary' }
+        history:
+          type: array
+          items: { $ref: '#/components/schemas/RemediationHistoryItem' }
+        trend:
+          type: array
+          maxItems: 8
+          items: { $ref: '#/components/schemas/CveTrendPoint' }
+
+    RemediationHistoryItem:
+      type: object
+      required: [id, image, engine, cvesFixed, before, after, at, status, sourceDigest, outputDigest, publishStatus]
+      properties:
+        id: { type: string }
+        image: { type: string }
+        engine: { type: string }
+        cvesFixed: { type: integer, minimum: 0 }
+        before: { type: integer, minimum: 0 }
+        after: { type: integer, minimum: 0 }
+        at: { type: string, format: date-time }
+        status: { type: string }
+        sourceDigest: { type: string }
+        outputDigest: { type: string }
+        publishStatus: { type: string }
+
+    Job:
+      type: object
+      properties:
+        id: { type: string, example: job_8f4b91 }
+        type: { type: string, enum: [ingest, scan, remediation, rebuild, publish] }
+        status: { type: string, enum: [queued, running, succeeded, failed] }
+        imageId: { type: string, nullable: true }
+        createdAt: { type: string }
+        updatedAt: { type: string }
+        resultUrl: { type: string, nullable: true, description: 'Bittiğinde sonuç kaynağının URL’i (ör. /remediation/{id})' }
+        error: { type: string, nullable: true }
+
+    TenantId:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'
+      example: payments
+    HarborTarget:
+      type: object
+      properties:
+        registry: { type: string }
+        project: { type: string }
+        repositoryPrefix: { type: string, example: approved/payments }
+    TenantHarborTarget:
+      type: object
+      description: >-
+        The team's Harbor target. Every field is optional. An empty registry or project
+        inherits the platform value; an empty folder becomes `<platform folder>/<team id>`
+        in the shared project, or the plain platform folder in a project of the team's own.
+        Two teams cannot use the same folder.
+      properties:
+        registry: { type: string, example: registry.example.com }
+        project: { type: string, example: payments }
+        onboardPrefix: { type: string, example: onboarded }
+        approvedPrefix: { type: string, example: approved }
+    Tenant:
+      type: object
+      required: [id, displayName, status, harbor, rowVersion]
+      properties:
+        id: { $ref: '#/components/schemas/TenantId' }
+        displayName: { type: string }
+        status: { type: string, enum: [active, disabled] }
+        harbor: { $ref: '#/components/schemas/TenantHarborTarget' }
+        effectiveHarbor:
+          type: object
+          description: The targets the team actually uses (its own values, else inherited or derived).
+          properties:
+            onboarding: { $ref: '#/components/schemas/HarborTarget' }
+            publish: { $ref: '#/components/schemas/HarborTarget' }
+        memberCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        rowVersion: { type: integer }
+    TenantMembership:
+      type: object
+      required: [tenantId, username, role, source]
+      properties:
+        tenantId: { $ref: '#/components/schemas/TenantId' }
+        username: { type: string }
+        role: { type: string, enum: [viewer, operator, approver] }
+        source: { type: string, enum: [manual, directory], description: '`directory` is reserved for AD group sync' }
+        createdBy: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    ImageComparison:
+      type: object
+      required: [contractVersion, kind, generatedAt, base, head, headline, attention, dimensions]
+      properties:
+        contractVersion: { type: string, enum: [ssi.image-comparison/v1] }
+        kind:
+          type: string
+          enum: [remediation, images]
+          description: >-
+            remediation = bir RM-EXEC job'unun kaynağı ↔ yamalı hali (tüm boyutlar);
+            images = taranmış iki serbest imaj (vulnerabilities-current; iki imaj da incelenmişse
+            packages, layers ve configuration da dolu, değilse unavailable)
+        jobId: { type: string, nullable: true, description: kind = images için null }
+        tenantId: { $ref: '#/components/schemas/TenantId' }
+        generatedAt: { type: string, format: date-time }
+        base: { $ref: '#/components/schemas/ImageComparisonSide' }
+        head: { $ref: '#/components/schemas/ImageComparisonSide' }
+        headline:
+          type: object
+          description: Kanıtı henüz olmayan değerler null döner
+          properties:
+            vulnerabilitiesFixed: { type: integer, nullable: true, description: 'remediation: doğrulama anındaki kanıttan; images: bugünkü taramalardan' }
+            vulnerabilitiesRemaining: { type: integer, nullable: true, description: 'remediation: doğrulama anındaki kanıttan; images: bugünkü taramalardan' }
+            vulnerabilitiesNew:
+              type: integer
+              nullable: true
+              description: >-
+                Yalnızca yamalı/karşılaştırılan imajda görülen zafiyetler (bugünkü tarama). remediation için,
+                aynı yamalı digest'e bağlı aday test paket raporu varsa yamanın değiştirmediği paketlerdeki
+                bulgular bu sayıya girmez (bkz. vulnerabilitiesNewUnchangedPackages). images için, iki imaj da
+                incelenmişse iki OS paket listesinde aynı sürümde olan paketlerdeki bulgular girmez.
+            vulnerabilitiesNewUnchangedPackages:
+              type: integer
+              nullable: true
+              description: >-
+                remediation: yamanın değiştirmediği paketlerdeki yeni bulgular; images: iki imajda aynı sürümdeki
+                paketlerdeki yeni bulgular. İkisi de yeni tarama verisinden gelir. Paket kanıtı yoksa null;
+                satırlarda packageChange sütunu da yalnızca o zaman var.
+            findingsBase: { type: integer, nullable: true, description: Base/kaynak imajın bugünkü bulgu sayısı }
+            findingsHead: { type: integer, nullable: true, description: Yamalı/karşılaştırılan imajın bugünkü bulgu sayısı }
+            packagesChanged: { type: integer, nullable: true }
+            packagesUnplanned: { type: integer, nullable: true }
+            configuration: { type: string, nullable: true, enum: [preserved, restored] }
+            runtimePassed: { type: boolean, nullable: true }
+            layersAdded: { type: integer, nullable: true }
+            sizeDeltaBytes: { type: integer, nullable: true, description: Patched (compared) minus source (base) image size }
+            packageDifferences: { type: integer, nullable: true, description: 'kind = images: changed + added + removed OS packages (both images inspected)' }
+            sameOs: { type: boolean, nullable: true, description: 'kind = images: both images use the same OS family (both inspected)' }
+            layersShared: { type: integer, nullable: true, description: 'kind = images: bottom layers both images share, in order' }
+        attention:
+          type: array
+          description: Onaylayanın önce bakması gerekenler; en önemlisi başta
+          items:
+            type: object
+            properties:
+              level: { type: string, enum: [high, warning, info] }
+              code: { type: string, example: new-in-patched }
+              message: { type: string }
+              dimension: { type: string }
+        dimensions:
+          type: array
+          items: { $ref: '#/components/schemas/ImageComparisonDimension' }
+    ImageComparisonSide:
+      type: object
+      properties:
+        role: { type: string, enum: [source, patched, base, compared] }
+        reference: { type: string }
+        digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        immutableReference: { type: string, description: 'kind = images: <project>/<repository>@sha256:…' }
+        registryReference: { type: string, description: 'kind = images: the imageReference for SSI - Image Inspection (<registry>/<project>/<repository>@sha256:…)' }
+        inspectedAt: { type: string, format: date-time, nullable: true, description: 'kind = images: when the image was inspected; null if not yet' }
+    ImageComparisonDimension:
+      type: object
+      required: [id, title, source, status, columns, rows]
+      properties:
+        id:
+          type: string
+          description: >-
+            v1 boyutları: vulnerabilities-verified, vulnerabilities-current, packages, configuration,
+            runtime, layers, supply-chain. Liste kapalı değildir; istemci bilmediği bir id'yi
+            columns/rows ile genel olarak göstermelidir.
+          example: packages
+        title: { type: string }
+        source: { type: string, description: Bu boyutun kanıt kaynağı (source of truth) }
+        status: { type: string, enum: [available, unavailable] }
+        note: { type: string }
+        summary: { type: object, additionalProperties: true }
+        columns:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              label: { type: string }
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              change: { type: string, enum: [new, fixed, remaining, changed, added, removed, restored, unchanged] }
+              changed: { type: boolean }
+        attention:
+          type: array
+          items: { type: object, additionalProperties: true }
+    Error:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }

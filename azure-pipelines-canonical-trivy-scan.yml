@@ -1,0 +1,211 @@
+# Manual canonical Trivy scan worker.
+# This pipeline only reads a digest-pinned Harbor artifact and publishes a raw OS-only JSON report.
+# It does not deploy SSI, patch an image or push to Harbor. With deliverToSsi=true and a
+# remediationJobId it also delivers the exact published bytes to that SSI Dry Run, HMAC-signed
+# (scripts/canonical-report.mjs); SSI starts it that way from the Remediation screen.
+trigger: none
+pr: none
+
+parameters:
+  - name: sourceRepository
+    displayName: Harbor source repository
+    type: string
+    default: ssi-remediation-test
+  - name: sourceDigest
+    displayName: Immutable source digest (sha256:...)
+    type: string
+    default: ''
+  - name: remediationJobId
+    displayName: SSI Dry Run job ID to deliver the report to (empty = artifact only)
+    type: string
+    default: ''
+  - name: deliverToSsi
+    displayName: Deliver the signed report to SSI
+    type: boolean
+    default: false
+
+pool: 'LinuxPool'
+
+variables:
+  HARBOR_HOST: registry.example.com
+  HARBOR_PROJECT: ssi-images
+  HARBOR_HOST_IP: 10.0.0.20
+  # Official Trivy v0.70.0 multi-platform manifest, pinned by digest.
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+
+stages:
+  - stage: CanonicalOsScan
+    displayName: 'Generate Canonical OS-only Trivy Report'
+    jobs:
+      - job: ScanImmutableArtifact
+        displayName: 'Scan immutable Harbor artifact'
+        steps:
+          # The delivery step runs scripts/canonical-report.mjs from this checkout.
+          - checkout: self
+
+          - script: |
+              set -euo pipefail
+
+              if [[ ! "${SOURCE_REPOSITORY}" =~ ^[a-z0-9][a-z0-9._/-]*$ ]]; then
+                echo 'sourceRepository must be a lower-case Harbor repository path.'
+                exit 2
+              fi
+
+              if [[ ! "${SOURCE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                echo 'sourceDigest must be a complete immutable sha256 digest. Tags are intentionally rejected.'
+                exit 2
+              fi
+
+              if ! command -v docker >/dev/null 2>&1; then
+                echo 'Docker is required to run the isolated Trivy container on this agent.'
+                exit 1
+              fi
+
+              if ! command -v node >/dev/null 2>&1; then
+                echo 'Node.js is required to validate the canonical JSON report on this agent.'
+                exit 1
+              fi
+
+              RUN_DIR="$(Pipeline.Workspace)/canonical-trivy"
+              IMAGE_REFERENCE="${HARBOR_HOST}/${HARBOR_PROJECT}/${SOURCE_REPOSITORY}@${SOURCE_DIGEST}"
+              DOCKER_HOST_ARGS=(--add-host "${HARBOR_HOST}:${HARBOR_HOST_IP}")
+              DOCKER_NETWORK_ARGS=(--network host)
+
+              mkdir -p "${RUN_DIR}/docker" "${RUN_DIR}/cache"
+              chmod 700 "${RUN_DIR}/docker"
+              trap 'rm -rf "${RUN_DIR}/docker"' EXIT
+
+              echo "Agent: ${AGENT_NAME:-unknown} on ${AGENT_MACHINENAME:-unknown}"
+              echo "Scanning immutable source: ${IMAGE_REFERENCE}"
+              echo "Using pinned Trivy image: ${TRIVY_IMAGE}"
+              timeout 5 bash -lc "cat < /dev/null > /dev/tcp/${HARBOR_HOST}/443"
+              echo 'Harbor 443 is reachable from the scan worker agent.'
+
+              # Scope credentials to a temporary Docker-compatible config. They are neither printed nor published.
+              harbor_auth="$(printf '%s:%s' "${HARBOR_ROBOT_USERNAME}" "${HARBOR_ROBOT_SECRET}" | base64 -w 0)"
+              printf '{"auths":{"%s":{"auth":"%s"}}}\n' "${HARBOR_HOST}" "${harbor_auth}" > "${RUN_DIR}/docker/config.json"
+              chmod 600 "${RUN_DIR}/docker/config.json"
+              unset harbor_auth
+              echo 'Temporary Harbor credential config prepared for the isolated scanner.'
+
+              # The scanner container has no Docker socket mount and performs a remote, read-only image scan.
+              docker run --rm \
+                "${DOCKER_NETWORK_ARGS[@]}" \
+                "${DOCKER_HOST_ARGS[@]}" \
+                --user "$(id -u):$(id -g)" \
+                -e DOCKER_CONFIG=/work/docker \
+                -e TRIVY_CACHE_DIR=/work/cache \
+                -v "${RUN_DIR}:/work" \
+                "${TRIVY_IMAGE}" image \
+                --insecure \
+                --image-src remote \
+                --scanners vuln \
+                --pkg-types os \
+                --ignore-unfixed \
+                --format json \
+                --output /work/canonical-trivy.json \
+                --quiet \
+                --timeout 15m \
+                "${IMAGE_REFERENCE}"
+
+              # Reject a malformed or mixed OS/library report before it can become Copa input,
+              # then slim it to the machine-to-machine contract fields before publishing.
+              node - "${RUN_DIR}/canonical-trivy.json" "${SOURCE_DIGEST}" <<'NODE'
+              const fs = require('node:fs');
+              const [reportPath, sourceDigest] = process.argv.slice(2);
+              const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              const results = Array.isArray(report.Results) ? report.Results : [];
+              const mixedClasses = results.filter((result) => result.Class !== 'os-pkgs');
+              const hasDigest = [report.ArtifactName, ...(report.Metadata?.RepoDigests || [])]
+                .filter(Boolean)
+                .some((reference) => String(reference).includes(sourceDigest));
+
+              if (Number(report.SchemaVersion) !== 2 || !hasDigest || mixedClasses.length > 0) {
+                throw new Error('Canonical Trivy validation failed: expected SchemaVersion 2, matching source digest, and only os-pkgs results.');
+              }
+
+              const findings = results.reduce((count, result) => count + (result.Vulnerabilities || []).length, 0);
+              console.log(`Canonical OS-only Trivy report validated: ${findings} finding(s).`);
+
+              // The canonical report is a machine-to-machine contract consumed by the SSI
+              // intake and the Copa worker. Neither uses Trivy's verbose free-text fields,
+              // so drop them to keep the artifact lean and comfortably within the intake
+              // size guard. Contract fields (package, versions, severity, CVSS) are kept.
+              let slimmed = 0;
+              for (const result of results) {
+                for (const vulnerability of (result.Vulnerabilities || [])) {
+                  if ('Description' in vulnerability || 'References' in vulnerability) slimmed += 1;
+                  delete vulnerability.Description;
+                  delete vulnerability.References;
+                }
+              }
+              fs.writeFileSync(reportPath, JSON.stringify(report));
+              console.log(`Canonical report slimmed: Description/References removed from ${slimmed} finding(s) before publish.`);
+              NODE
+            displayName: 'Create and validate canonical OS-only Trivy JSON'
+            env:
+              SOURCE_REPOSITORY: ${{ parameters.sourceRepository }}
+              SOURCE_DIGEST: ${{ parameters.sourceDigest }}
+              HARBOR_ROBOT_USERNAME: $(HARBOR_ROBOT_USERNAME)
+              HARBOR_ROBOT_SECRET: $(HARBOR_ROBOT_SECRET)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish canonical Trivy JSON'
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/canonical-trivy/canonical-trivy.json'
+              ArtifactName: 'canonical-trivy-os-report'
+              publishLocation: 'Container'
+
+          - script: |
+              set -euo pipefail
+              TOOL="${BUILD_SOURCESDIRECTORY:?BUILD_SOURCESDIRECTORY is required}/scripts/canonical-report.mjs"
+              REPORT="$(Pipeline.Workspace)/canonical-trivy/canonical-trivy.json"
+              fail() {
+                echo "##vso[task.logissue type=error]$1"
+                exit 1
+              }
+
+              # Azure DevOps renders boolean parameters as True/False.
+              DELIVER_TO_SSI="$(printf '%s' "${SSI_CANONICAL_DELIVER:-}" | tr '[:upper:]' '[:lower:]')"
+              [[ "${DELIVER_TO_SSI}" == 'true' || "${DELIVER_TO_SSI}" == 'false' ]] || fail 'deliverToSsi must be true or false.'
+              if [[ "${DELIVER_TO_SSI}" != 'true' ]]; then
+                echo 'Delivery to SSI is off; upload canonical-trivy.json from the run artifact on the Dry Run page.'
+                exit 0
+              fi
+              [[ "${REMEDIATION_JOB_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+                || fail 'remediationJobId must name the SSI Dry Run job when deliverToSsi is true.'
+              [[ -r "${TOOL}" ]] || fail 'scripts/canonical-report.mjs is missing from the SSI checkout.'
+
+              if [[ -z "${SSI_CANONICAL_REPORT_HMAC_SECRET:-}" || "${SSI_CANONICAL_REPORT_HMAC_SECRET}" == \$\(* ]] \
+                || [[ -z "${SSI_API_BASE_URL:-}" || "${SSI_API_BASE_URL}" == \$\(* ]]; then
+                echo '##vso[task.logissue type=warning]SSI_API_BASE_URL or the secret SSI_CANONICAL_REPORT_HMAC_SECRET is not set; upload canonical-trivy.json from the run artifact on the Dry Run page.'
+                echo '##vso[task.complete result=SucceededWithIssues;]'
+                exit 0
+              fi
+
+              set +e
+              node "${TOOL}" deliver \
+                --file "${REPORT}" \
+                --job-id "${REMEDIATION_JOB_ID}" \
+                --api-base-url "${SSI_API_BASE_URL}" \
+                --allow-http "${SSI_API_ALLOW_HTTP:-false}" \
+                --worker-id "${AGENT_NAME:-agent}:${AGENT_MACHINENAME:-unknown}"
+              delivery_status=$?
+              set -e
+              if [[ "${delivery_status}" -eq 2 ]]; then
+                echo '##vso[task.logissue type=warning]SSI was unreachable; upload canonical-trivy.json from the run artifact or run the scan again.'
+                echo '##vso[task.complete result=SucceededWithIssues;]'
+              elif [[ "${delivery_status}" -ne 0 ]]; then
+                fail 'SSI rejected the canonical report (see the message above).'
+              fi
+            displayName: 'Deliver canonical report to SSI'
+            env:
+              SSI_CANONICAL_DELIVER: ${{ parameters.deliverToSsi }}
+              REMEDIATION_JOB_ID: ${{ parameters.remediationJobId }}
+              SSI_API_BASE_URL: $(SSI_API_BASE_URL)
+              SSI_API_ALLOW_HTTP: $(SSI_API_ALLOW_HTTP)
+              SSI_CANONICAL_REPORT_HMAC_SECRET: $(SSI_CANONICAL_REPORT_HMAC_SECRET)
+
+          - script: rm -rf "$(Pipeline.Workspace)/canonical-trivy"
+            displayName: 'Remove temporary scanner credentials and cache'
+            condition: always()

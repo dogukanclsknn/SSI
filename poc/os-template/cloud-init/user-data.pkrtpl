@@ -1,0 +1,15 @@
+#cloud-config
+# Build-time only (Packer renders this into the cidata disk). The build user, its key and its
+# sudo rule exist while the template is built and are removed when it is sealed.
+users:
+  - name: ${build_user}
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+ssh_pwauth: false
+disable_root: true
+package_update: false
+package_upgrade: false

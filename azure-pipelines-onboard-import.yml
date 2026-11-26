@@ -1,0 +1,515 @@
+# Manual, fail-closed onboarding import worker.
+#
+# The SSI API records an onboarding request and hands off a credential-free,
+# quarantine-targeted manifest. This isolated worker owns the narrowly scoped
+# Harbor write credential and imports an EXTERNAL (untrusted) image into a
+# dedicated quarantine prefix (default: onboarded/) — never next to approved/.
+# The default run is prepare-only and cannot mutate the registry. The imported
+# image must still pass the normal scan + remediation + publish flow to be
+# promoted.
+trigger: none
+pr: none
+
+parameters:
+  - name: onboardingRequestId
+    displayName: SSI onboarding request ID
+    type: string
+    default: ONB-0001
+  # The worker sends its handoff and receipt tokens to this address and trusts the
+  # handoff it returns, so only the SSI addresses listed here can be chosen. Azure
+  # DevOps refuses a run that names any other value (UI and REST API alike). A new
+  # SSI address is a reviewed change to this list.
+  - name: ssiApiBaseUrl
+    displayName: SSI API base URL
+    type: string
+    default: http://10.0.0.10:5021/api/v1
+    values:
+      - http://10.0.0.10:5021/api/v1
+      - http://ssi.example.com/api/v1
+  - name: allowInsecurePocApi
+    displayName: Allow HTTP only for the current isolated PoC API
+    type: boolean
+    default: false
+  - name: harborCaCertPath
+    displayName: Trusted Harbor CA PEM path, or system
+    type: string
+    default: system
+  - name: executeImport
+    displayName: Execute the quarantine import (pull + copy + scan)
+    type: boolean
+    default: false
+
+pool: 'LinuxPool'
+
+# Values in this block are fixed: Azure DevOps does not let a run override a variable
+# defined in the YAML file, at queue time or through the REST API.
+variables:
+  REGCTL_IMAGE: docker.io/regclient/regctl@sha256:dbe356c6cf9f8f85e302b9e47fed481ef3f1b04807350e99b02ab2cadee0a993
+  # Official Trivy v0.70.0 multi-platform manifest, pinned by digest (same as the other workers).
+  TRIVY_IMAGE: ghcr.io/aquasecurity/trivy@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+  # The only place this worker may write. The handoff must name exactly this registry and
+  # project and a repository under this prefix, or the run stops before any credential is used.
+  SSI_ONBOARD_TARGET_REGISTRY: registry.example.com
+  SSI_ONBOARD_TARGET_PROJECT: ssi-images
+  SSI_ONBOARD_TARGET_PREFIX: onboarded
+
+stages:
+  - stage: OnboardImport
+    displayName: 'Quarantine import of an external image'
+    jobs:
+      - job: ImportToQuarantine
+        displayName: 'Import external image into the quarantine prefix'
+        steps:
+          - checkout: none
+
+          - script: |
+              set -euo pipefail
+
+              RUN_DIR="$(Pipeline.Workspace)/ssi-onboard-import"
+              HANDOFF_FILE="${RUN_DIR}/onboard-handoff.json"
+              rm -rf "${RUN_DIR}"
+              mkdir -p "${RUN_DIR}"
+              chmod 700 "${RUN_DIR}"
+
+              if [[ ! "${ONBOARDING_REQUEST_ID}" =~ ^ONB-[0-9]{4,}$ ]]; then
+                echo 'onboardingRequestId must use the ONB-0001 format.'
+                exit 2
+              fi
+              # Azure DevOps expands boolean parameters as True/False; normalize before the
+              # fail-closed comparison so a capitalized value never opens the HTTP exception.
+              ALLOW_INSECURE_POC_API="$(printf '%s' "${ALLOW_INSECURE_POC_API}" | tr '[:upper:]' '[:lower:]')"
+              if [[ "${SSI_API_BASE_URL}" != https://* && "${ALLOW_INSECURE_POC_API}" != 'true' ]]; then
+                echo "Refusing to send a worker token over HTTP. Use HTTPS or explicitly enable the isolated PoC exception. (allowInsecurePocApi='${ALLOW_INSECURE_POC_API}')"
+                exit 2
+              fi
+              if [[ -z "${ONBOARD_HANDOFF_TOKEN}" || "${ONBOARD_HANDOFF_TOKEN}" == '$('* ]]; then
+                echo 'ONBOARD_HANDOFF_TOKEN secret variable is required.'
+                exit 2
+              fi
+
+              # SSI API call with bounded retry. The build host's route to SSI has shown transient
+              # connect timeouts, so connection failures and timeouts (curl 6, 7, 28, 35, 52, 56) and
+              # HTTP 502/503/504 are retried with linear backoff; any definite answer (2xx/4xx/other
+              # 5xx) is returned at once. Both onboarding endpoints are idempotent, so a retried call
+              # that reached SSI the first time cannot change the outcome. Prints the final HTTP code.
+              # (curl --fail-with-body needs 7.76+, which the shared agent image lacks; the status is
+              # captured explicitly. The SSI API never echoes the worker token in a response.)
+              ssi_api_call() {
+                local output_file="$1"; shift
+                local attempt=1 max_attempts=5 status='000' rc=0
+                while :; do
+                  set +e
+                  status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+                    -o "${output_file}" -w '%{http_code}' "$@")"
+                  rc=$?
+                  set -e
+                  status="${status:-000}"
+                  case "${rc}" in
+                    0) [[ "${status}" =~ ^50[234]$ ]] || { printf '%s' "${status}"; return 0; } ;;
+                    6|7|28|35|52|56) ;;
+                    *) printf '%s' "${status}"; return 0 ;;
+                  esac
+                  if (( attempt >= max_attempts )); then
+                    printf '%s' "${status}"
+                    return 0
+                  fi
+                  echo "SSI API attempt ${attempt}/${max_attempts} failed (curl exit ${rc}, HTTP ${status}); retrying in $((attempt * 5))s." >&2
+                  sleep $((attempt * 5))
+                  attempt=$((attempt + 1))
+                done
+              }
+
+              handoff_status="$(ssi_api_call "${HANDOFF_FILE}" \
+                -H "X-SSI-Onboard-Handoff-Token: ${ONBOARD_HANDOFF_TOKEN}" \
+                "${SSI_API_BASE_URL%/}/onboarding/${ONBOARDING_REQUEST_ID}/worker-handoff")"
+              if [[ "${handoff_status}" != '200' ]]; then
+                echo "Onboarding handoff request failed with HTTP ${handoff_status:-000}."
+                head -c 2000 "${HANDOFF_FILE}" 2>/dev/null || true
+                echo
+                exit 2
+              fi
+
+              HANDOFF_FILE="${HANDOFF_FILE}" EXPECTED_REQUEST_ID="${ONBOARDING_REQUEST_ID}" \
+                EXPECTED_TARGET_REGISTRY="${SSI_ONBOARD_TARGET_REGISTRY:-}" \
+                EXPECTED_TARGET_PROJECT="${SSI_ONBOARD_TARGET_PROJECT:-}" \
+                EXPECTED_TARGET_PREFIX="${SSI_ONBOARD_TARGET_PREFIX:-}" node <<'NODE'
+              const fs = require('fs');
+              const handoff = JSON.parse(fs.readFileSync(process.env.HANDOFF_FILE, 'utf8'));
+              const tag = /^[\w][\w.-]{0,127}$/;
+              const fail = (message) => { throw new Error(message); };
+
+              if (handoff.contractVersion !== 'ssi.onboard-handoff/v1') fail('Unsupported onboarding handoff contract.');
+              if (handoff.requestId !== process.env.EXPECTED_REQUEST_ID) fail('Onboarding handoff request ID mismatch.');
+              if (!handoff.source?.reference) fail('Onboarding handoff has no source reference.');
+              if (!handoff.target?.registry || !handoff.target?.project || !handoff.target?.repository) {
+                fail('Onboarding target is incomplete.');
+              }
+              // Pinned boundary (variables block): the handoff cannot steer the write credential
+              // to another registry, project or folder, even if the handoff itself were forged.
+              const pinned = {
+                registry: process.env.EXPECTED_TARGET_REGISTRY || '',
+                project: process.env.EXPECTED_TARGET_PROJECT || '',
+                prefix: process.env.EXPECTED_TARGET_PREFIX || '',
+              };
+              if (!pinned.registry || !pinned.project || !pinned.prefix) fail('The pinned onboarding target is not configured in this pipeline.');
+              if (handoff.target.registry !== pinned.registry) fail(`Onboarding target registry must be ${pinned.registry}.`);
+              if (handoff.target.project !== pinned.project) fail(`Onboarding target project must be ${pinned.project}.`);
+              const component = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+              const segments = String(handoff.target.repository).split('/');
+              if (segments.length < 2 || segments[0] !== pinned.prefix || !segments.every((segment) => component.test(segment))) {
+                fail(`Onboarding target must be a repository under ${pinned.prefix}/.`);
+              }
+              if (!tag.test(handoff.target?.tag || '')) fail('Onboarding target tag is invalid.');
+              const expectedTarget = `${handoff.target.registry}/${handoff.target.project}/${handoff.target.repository}:${handoff.target.tag}`;
+              if (handoff.target.tagReference !== expectedTarget) fail('Onboarding target reference is inconsistent.');
+              if (handoff.constraints?.credentialMaterialIncluded !== false ||
+                  handoff.constraints?.overwriteExistingTag !== false ||
+                  handoff.constraints?.quarantine !== true) {
+                fail('Onboarding handoff constraints are not fail-closed.');
+              }
+              const serialized = JSON.stringify(handoff).toLowerCase();
+              if (serialized.includes('password') || serialized.includes('secret') || serialized.includes('token')) {
+                fail('Onboarding handoff contains credential-like material.');
+              }
+              NODE
+
+              echo 'Credential-free, quarantine-targeted onboarding handoff validated.'
+            displayName: 'Fetch and validate onboarding handoff'
+            env:
+              ONBOARDING_REQUEST_ID: ${{ parameters.onboardingRequestId }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              ALLOW_INSECURE_POC_API: ${{ parameters.allowInsecurePocApi }}
+              ONBOARD_HANDOFF_TOKEN: $(ONBOARD_HANDOFF_TOKEN)
+              SSI_ONBOARD_TARGET_REGISTRY: $(SSI_ONBOARD_TARGET_REGISTRY)
+              SSI_ONBOARD_TARGET_PROJECT: $(SSI_ONBOARD_TARGET_PROJECT)
+              SSI_ONBOARD_TARGET_PREFIX: $(SSI_ONBOARD_TARGET_PREFIX)
+
+          - script: |
+              set -euo pipefail
+
+              RUN_DIR="$(Pipeline.Workspace)/ssi-onboard-import"
+              HANDOFF_FILE="${RUN_DIR}/onboard-handoff.json"
+              RECEIPT_FILE="${RUN_DIR}/onboard-receipt.json"
+              SCAN_FILE="${RUN_DIR}/trivy-scan.json"
+              CA_FILE="${RUN_DIR}/harbor-ca.pem"
+              REGCTL_CONFIG_DIR="${RUN_DIR}/regctl"
+              TRIVY_CACHE_DIR="${RUN_DIR}/trivy-cache"
+
+              cleanup_sensitive() {
+                rm -rf "${REGCTL_CONFIG_DIR}" "${CA_FILE}"
+              }
+              trap cleanup_sensitive EXIT
+
+              # Receipts are signed (docs/azure-devops-integration.md, "Worker sınırları"): HMAC-SHA256 over
+              # the channel purpose, a timestamp, the request ID, this worker's ID and the SHA-256 of the exact
+              # receipt bytes. SSI refuses a receipt that was altered, is older than its age limit, names
+              # another worker, or was signed for another request or channel. The secret stays in this process.
+              WORKER_ID="$(printf '%s:%s' "${AGENT_NAME:-unknown}" "${AGENT_MACHINENAME:-unknown}" | tr -c 'A-Za-z0-9._:-' '-' | cut -c1-128)"
+              [[ "${WORKER_ID}" =~ ^[A-Za-z0-9] ]] || WORKER_ID="w${WORKER_ID:0:127}"
+              # Prints the signature headers of a receipt file, one per line; fails when it cannot sign.
+              receipt_signature_headers() {
+                RECEIPT_FILE="$1" SUBJECT="${ONBOARDING_REQUEST_ID}" WORKER_ID="${WORKER_ID}" node <<'NODE'
+              const { createHash, createHmac } = require('node:crypto');
+              const body = require('node:fs').readFileSync(process.env.RECEIPT_FILE);
+              const secret = process.env.SSI_ONBOARD_RECEIPT_HMAC_SECRET || '';
+              if (Buffer.byteLength(secret, 'utf8') < 32) {
+                console.error('SSI_ONBOARD_RECEIPT_HMAC_SECRET must contain at least 32 bytes.');
+                process.exit(1);
+              }
+              const timestamp = Math.floor(Date.now() / 1000);
+              const contentDigest = `sha256:${createHash('sha256').update(body).digest('hex')}`;
+              const payload = ['ssi-onboard-receipt-v1', timestamp, process.env.SUBJECT, process.env.WORKER_ID, contentDigest].join('\n');
+              const signature = createHmac('sha256', secret).update(payload).digest('hex');
+              console.log('X-SSI-Evidence-Version: v1');
+              console.log(`X-SSI-Evidence-Timestamp: ${timestamp}`);
+              console.log(`X-SSI-Evidence-Content-SHA256: ${contentDigest}`);
+              console.log(`X-SSI-Evidence-Worker-ID: ${process.env.WORKER_ID}`);
+              console.log(`X-SSI-Evidence-Signature: sha256=${signature}`);
+              NODE
+              }
+              # Fills RECEIPT_CURL_HEADERS with the curl -H arguments that sign a receipt file.
+              sign_receipt() {
+                local headers
+                headers="$(receipt_signature_headers "$1")" || return 1
+                RECEIPT_CURL_HEADERS=()
+                while IFS= read -r header; do RECEIPT_CURL_HEADERS+=(-H "${header}"); done <<<"${headers}"
+              }
+
+              # SSI API call with bounded retry. The build host's route to SSI has shown transient
+              # connect timeouts, so connection failures and timeouts (curl 6, 7, 28, 35, 52, 56) and
+              # HTTP 502/503/504 are retried with linear backoff; any definite answer (2xx/4xx/other
+              # 5xx) is returned at once. Both onboarding endpoints are idempotent, so a retried call
+              # that reached SSI the first time cannot change the outcome. Prints the final HTTP code.
+              # (curl --fail-with-body needs 7.76+, which the shared agent image lacks; the status is
+              # captured explicitly. The SSI API never echoes the worker token in a response.)
+              ssi_api_call() {
+                local output_file="$1"; shift
+                local attempt=1 max_attempts=5 status='000' rc=0
+                while :; do
+                  set +e
+                  status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+                    -o "${output_file}" -w '%{http_code}' "$@")"
+                  rc=$?
+                  set -e
+                  status="${status:-000}"
+                  case "${rc}" in
+                    0) [[ "${status}" =~ ^50[234]$ ]] || { printf '%s' "${status}"; return 0; } ;;
+                    6|7|28|35|52|56) ;;
+                    *) printf '%s' "${status}"; return 0 ;;
+                  esac
+                  if (( attempt >= max_attempts )); then
+                    printf '%s' "${status}"
+                    return 0
+                  fi
+                  echo "SSI API attempt ${attempt}/${max_attempts} failed (curl exit ${rc}, HTTP ${status}); retrying in $((attempt * 5))s." >&2
+                  sleep $((attempt * 5))
+                  attempt=$((attempt + 1))
+                done
+              }
+
+              EXECUTE_IMPORT="$(printf '%s' "${EXECUTE_IMPORT}" | tr '[:upper:]' '[:lower:]')"
+              if [[ "${EXECUTE_IMPORT}" != 'true' ]]; then
+                echo 'Prepare-only run completed. No pull or registry write was attempted.'
+                exit 0
+              fi
+
+              for value_name in ONBOARD_ROBOT_USERNAME ONBOARD_ROBOT_SECRET SSI_ONBOARD_RECEIPT_HMAC_SECRET; do
+                value="${!value_name:-}"
+                if [[ -z "${value}" || "${value}" == '$('* ]]; then
+                  echo "${value_name} secret variable is required for an execution run."
+                  exit 2
+                fi
+              done
+              if ! command -v docker >/dev/null 2>&1; then
+                echo 'Docker is required on the isolated onboarding worker.'
+                exit 2
+              fi
+
+              mapfile -t HANDOFF_VALUES < <(HANDOFF_FILE="${HANDOFF_FILE}" node <<'NODE'
+              const handoff = JSON.parse(require('fs').readFileSync(process.env.HANDOFF_FILE, 'utf8'));
+              console.log(handoff.source.reference);
+              console.log(handoff.target.tagReference);
+              console.log(handoff.target.registry);
+              NODE
+              )
+              SOURCE_REFERENCE="${HANDOFF_VALUES[0]}"
+              TARGET_REFERENCE="${HANDOFF_VALUES[1]}"
+              TARGET_REGISTRY="${HANDOFF_VALUES[2]}"
+              # The write credential is only ever presented to the pinned registry.
+              if [[ -z "${SSI_ONBOARD_TARGET_REGISTRY:-}" || "${TARGET_REGISTRY}" != "${SSI_ONBOARD_TARGET_REGISTRY}" ]]; then
+                echo "Onboarding target registry is not the pinned ${SSI_ONBOARD_TARGET_REGISTRY:-registry}; no credential was used."
+                exit 2
+              fi
+
+              mkdir -p "${REGCTL_CONFIG_DIR}" "${TRIVY_CACHE_DIR}"
+              chmod 700 "${REGCTL_CONFIG_DIR}"
+              if [[ "${HARBOR_CA_CERT_PATH}" == 'system' ]]; then
+                for candidate in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+                  if [[ -r "${candidate}" ]]; then cp "${candidate}" "${CA_FILE}"; break; fi
+                done
+              elif [[ -r "${HARBOR_CA_CERT_PATH}" ]]; then
+                cp "${HARBOR_CA_CERT_PATH}" "${CA_FILE}"
+              else
+                echo 'Configured Harbor CA PEM path is not readable on this worker.'
+                exit 2
+              fi
+              if [[ ! -s "${CA_FILE}" ]]; then
+                echo 'No trusted CA bundle is available for the onboarding worker.'
+                exit 2
+              fi
+              chmod 600 "${CA_FILE}"
+
+              regctl() {
+                docker run --interactive --rm --network host \
+                  --user "$(id -u):$(id -g)" \
+                  -e REGCTL_CONFIG=/work/regctl/config.json \
+                  -e SSL_CERT_FILE=/work/harbor-ca.pem \
+                  -v "${RUN_DIR}:/work" \
+                  "${REGCTL_IMAGE}" "$@"
+              }
+
+              # Report a failed import back to SSI so the request reflects Failed instead of a
+              # stuck Importing. Best-effort: never masks the original non-zero exit.
+              report_failure() {
+                local reason="$1"
+                REQUEST_ID="${ONBOARDING_REQUEST_ID}" REASON="${reason}" \
+                WORKER_ID="${WORKER_ID}" \
+                RECEIPT_FILE="${RECEIPT_FILE}" node <<'NODE'
+              const fs = require('fs');
+              fs.writeFileSync(process.env.RECEIPT_FILE, JSON.stringify({
+                contractVersion: 'ssi.onboard-receipt/v1',
+                requestId: process.env.REQUEST_ID,
+                status: 'failed',
+                error: process.env.REASON,
+                workerId: process.env.WORKER_ID,
+              }));
+              NODE
+                sign_receipt "${RECEIPT_FILE}" || { echo 'The failure receipt could not be signed.'; return 0; }
+                ssi_api_call /dev/null \
+                  -H 'Content-Type: application/json' \
+                  "${RECEIPT_CURL_HEADERS[@]}" \
+                  --data-binary "@${RECEIPT_FILE}" \
+                  "${SSI_API_BASE_URL%/}/onboarding/${ONBOARDING_REQUEST_ID}/import-receipt" >/dev/null || true
+              }
+
+              harbor_status="$(curl --silent --show-error --connect-timeout 5 --max-time 10 \
+                --cacert "${CA_FILE}" -o /dev/null -w '%{http_code}' "https://${TARGET_REGISTRY}/v2/" || true)"
+              if [[ "${harbor_status}" != '200' && "${harbor_status}" != '401' && "${harbor_status}" != '403' ]]; then
+                echo "Registry TLS validation failed with HTTP ${harbor_status}."
+                exit 3
+              fi
+
+              if ! printf '%s' "${ONBOARD_ROBOT_SECRET}" | regctl registry login \
+                "${TARGET_REGISTRY}" --user "${ONBOARD_ROBOT_USERNAME}" --pass-stdin; then
+                echo 'Dedicated onboarding robot could not authenticate to the quarantine registry.'
+                exit 3
+              fi
+              chmod 600 "${REGCTL_CONFIG_DIR}/config.json"
+
+              # Optional source-registry auth for private sources (public sources stay anonymous).
+              # Azure passes an undefined variable as the literal $(NAME); treat that as unset.
+              if [[ -n "${SOURCE_ROBOT_USERNAME:-}" && "${SOURCE_ROBOT_USERNAME}" != '$('* \
+                    && -n "${SOURCE_ROBOT_SECRET:-}" && "${SOURCE_ROBOT_SECRET}" != '$('* ]]; then
+                SOURCE_REGISTRY="${SOURCE_REFERENCE%%/*}"
+                printf '%s' "${SOURCE_ROBOT_SECRET}" | regctl registry login \
+                  "${SOURCE_REGISTRY}" --user "${SOURCE_ROBOT_USERNAME}" --pass-stdin || {
+                    report_failure 'Source registry authentication failed.'; echo 'Source registry auth failed.'; exit 3; }
+              fi
+
+              # Resolve and pin the external source to an immutable digest.
+              echo '##vso[task.setprogress value=10;]Resolving source digest'
+              if ! SOURCE_DIGEST="$(regctl image digest "${SOURCE_REFERENCE}" 2>"${RUN_DIR}/source-error.txt")"; then
+                report_failure 'Source image could not be resolved from the external registry.'
+                echo 'Source image resolution failed.'; head -c 1000 "${RUN_DIR}/source-error.txt" || true; exit 4
+              fi
+              if [[ ! "${SOURCE_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+                report_failure 'Resolved source digest is not a valid sha256 digest.'
+                echo 'Invalid source digest.'; exit 4
+              fi
+              SOURCE_PINNED="${SOURCE_REFERENCE%%@*}"
+              SOURCE_PINNED="${SOURCE_PINNED%:*}@${SOURCE_DIGEST}"
+
+              # Never overwrite an existing quarantine tag with a different manifest.
+              set +e
+              existing_output="$(regctl image digest "${TARGET_REFERENCE}" 2>&1)"
+              existing_status=$?
+              set -e
+              if [[ ${existing_status} -eq 0 ]]; then
+                if [[ "${existing_output}" == "${SOURCE_DIGEST}" ]]; then
+                  echo 'Quarantine tag already carries this manifest digest; resuming without a registry write.'
+                else
+                  report_failure 'Quarantine tag already exists with a different manifest; refusing to overwrite.'
+                  echo 'Quarantine tag exists with a different manifest. Refusing to overwrite.'
+                  printf 'existing=%s source=%s\n' "${existing_output}" "${SOURCE_DIGEST}"; exit 4
+                fi
+              elif ! grep -Eiq 'not found|manifest unknown|404' <<<"${existing_output}"; then
+                report_failure 'Quarantine tag availability could not be proven.'
+                echo 'Target availability could not be proven; refusing to treat the error as a missing tag.'
+                printf '%s\n' "${existing_output}"; exit 4
+              else
+                echo '##vso[task.setprogress value=25;]Copying image to Harbor quarantine'
+                echo 'Copying the pinned external manifest into the quarantine prefix.'
+                if ! regctl image copy "${SOURCE_PINNED}" "${TARGET_REFERENCE}"; then
+                  report_failure 'Copy into the quarantine prefix failed.'; echo 'Copy failed.'; exit 4
+                fi
+              fi
+
+              echo '##vso[task.setprogress value=60;]Verifying imported digest'
+              target_digest="$(regctl image digest "${TARGET_REFERENCE}")"
+              if [[ "${target_digest}" != "${SOURCE_DIGEST}" ]]; then
+                report_failure 'Imported digest does not preserve the source manifest.'
+                echo 'Imported target digest does not preserve the source manifest.'; exit 5
+              fi
+
+              # Best-effort Trivy scan for the receipt summary. Harbor also auto-scans on push,
+              echo '##vso[task.setprogress value=70;]Scanning imported image with Trivy'
+              # so a Trivy hiccup here never fails the import; the summary is just omitted.
+              SCAN_JSON='null'
+              if docker run --rm --network host --user "$(id -u):$(id -g)" \
+                   -e SSL_CERT_FILE=/work/harbor-ca.pem \
+                   -v "${RUN_DIR}:/work" -v "${TRIVY_CACHE_DIR}:/root/.cache" \
+                   "${TRIVY_IMAGE}" image --quiet --timeout 8m --format json \
+                   --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+                   --output /work/trivy-scan.json "${TARGET_REFERENCE}@${target_digest}" 2>/dev/null; then
+                SCAN_JSON="$(SCAN_FILE="${SCAN_FILE}" node <<'NODE'
+              const fs = require('fs');
+              try {
+                const report = JSON.parse(fs.readFileSync(process.env.SCAN_FILE, 'utf8'));
+                const counts = { critical: 0, high: 0, medium: 0, low: 0, unknown: 0 };
+                for (const result of report.Results || []) {
+                  for (const v of result.Vulnerabilities || []) {
+                    const key = String(v.Severity || 'UNKNOWN').toLowerCase();
+                    if (key in counts) counts[key] += 1;
+                  }
+                }
+                process.stdout.write(JSON.stringify(counts));
+              } catch { process.stdout.write('null'); }
+              NODE
+              )"
+              else
+                echo 'Trivy scan was not available; Harbor auto-scan will populate the result.'
+              fi
+
+              echo '##vso[task.setprogress value=90;]Submitting signed import receipt'
+              REQUEST_ID="${ONBOARDING_REQUEST_ID}" \
+              TARGET_DIGEST="${target_digest}" \
+              TARGET_REFERENCE="${TARGET_REFERENCE}" \
+              SCAN_JSON="${SCAN_JSON}" \
+              WORKER_ID="${WORKER_ID}" \
+              RECEIPT_FILE="${RECEIPT_FILE}" node <<'NODE'
+              const fs = require('fs');
+              let scanSummary = null;
+              try { scanSummary = JSON.parse(process.env.SCAN_JSON); } catch { scanSummary = null; }
+              fs.writeFileSync(process.env.RECEIPT_FILE, JSON.stringify({
+                contractVersion: 'ssi.onboard-receipt/v1',
+                requestId: process.env.REQUEST_ID,
+                status: 'imported',
+                importedDigest: process.env.TARGET_DIGEST,
+                targetReference: process.env.TARGET_REFERENCE,
+                scanSummary,
+                workerId: process.env.WORKER_ID,
+                importedAt: new Date().toISOString(),
+              }, null, 2));
+              NODE
+              if ! sign_receipt "${RECEIPT_FILE}"; then
+                echo 'The onboarding receipt could not be signed after a verified import.'
+                echo 'The image is already in quarantine. Re-run this pipeline with the same request ID: it resumes without a registry write and resubmits the receipt.'
+                exit 6
+              fi
+
+              receipt_status="$(ssi_api_call "${RUN_DIR}/accepted-onboarding-request.json" \
+                -H 'Content-Type: application/json' \
+                "${RECEIPT_CURL_HEADERS[@]}" \
+                --data-binary "@${RECEIPT_FILE}" \
+                "${SSI_API_BASE_URL%/}/onboarding/${ONBOARDING_REQUEST_ID}/import-receipt")"
+              if [[ "${receipt_status}" != '200' ]]; then
+                echo "Onboarding receipt submission failed with HTTP ${receipt_status:-000} after a verified import."
+                echo 'The image is already in quarantine. Re-run this pipeline with the same request ID: it resumes without a registry write and resubmits the receipt.'
+                head -c 2000 "${RUN_DIR}/accepted-onboarding-request.json" 2>/dev/null || true
+                echo
+                exit 6
+              fi
+
+              echo "Quarantine import verified: ${TARGET_REFERENCE}@${target_digest}"
+            displayName: 'Import external image into quarantine and submit receipt'
+            env:
+              EXECUTE_IMPORT: ${{ parameters.executeImport }}
+              ONBOARDING_REQUEST_ID: ${{ parameters.onboardingRequestId }}
+              SSI_API_BASE_URL: ${{ parameters.ssiApiBaseUrl }}
+              HARBOR_CA_CERT_PATH: ${{ parameters.harborCaCertPath }}
+              REGCTL_IMAGE: $(REGCTL_IMAGE)
+              TRIVY_IMAGE: $(TRIVY_IMAGE)
+              SSI_ONBOARD_TARGET_REGISTRY: $(SSI_ONBOARD_TARGET_REGISTRY)
+              ONBOARD_ROBOT_USERNAME: $(ONBOARD_ROBOT_USERNAME)
+              ONBOARD_ROBOT_SECRET: $(ONBOARD_ROBOT_SECRET)
+              SSI_ONBOARD_RECEIPT_HMAC_SECRET: $(SSI_ONBOARD_RECEIPT_HMAC_SECRET)
+              SOURCE_ROBOT_USERNAME: $(SOURCE_ROBOT_USERNAME)
+              SOURCE_ROBOT_SECRET: $(SOURCE_ROBOT_SECRET)
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish onboarding import evidence'
+            condition: always()
+            inputs:
+              PathtoPublish: '$(Pipeline.Workspace)/ssi-onboard-import'
+              ArtifactName: 'onboarding-import-evidence'
+              publishLocation: 'Container'
